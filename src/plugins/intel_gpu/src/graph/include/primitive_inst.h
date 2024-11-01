@@ -21,7 +21,7 @@
 #include "intel_gpu/graph/serialization/layout_serializer.hpp"
 #include "intel_gpu/graph/serialization/vector_serializer.hpp"
 #include "intel_gpu/runtime/itt.hpp"
-#include "runtime/kernels_cache.hpp"
+#include "impls/ocl/kernels_cache.hpp"
 
 // TODO: add generic interface for weights_reorder_params and get rid of this dependency
 #include "impls/ocl/kernel_selector_helper.h"
@@ -325,6 +325,7 @@ public:
     virtual int32_t get_prealloc_iter_num() { return -1; }
     virtual void update_shape_info_tensor(const kernel_impl_params& params);
     kernel_impl_params get_fake_aligned_params_if_possible(kernel_impl_params const& orig_impl_param);
+    bool all_dependencies_cpu_impl() const;
 
 protected:
     primitive_inst(network& network, program_node const& node, bool allocate_memory);
