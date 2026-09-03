@@ -1186,7 +1186,10 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                             OPENVINO_ASSERT(present_seq_length == present_tile_size,
                                             "HFA: present KV length must equal the compiled query/present tile size");
                             const int64_t mask_total_length = attention_mask_tensor->get_shape()[MASK_KV_SEQ_DIM];
-                            const int64_t final_mask_offset = mask_total_length - final_tile_size;
+                            const bool is_prefill = state.hfa_selector->this_case() ==
+                                                    runtime::host_flash_attention::Selector::Case::PREFILL;
+                            const int64_t final_mask_offset = is_prefill ? total_kv_length - final_tile_size
+                                                                         : mask_total_length - final_tile_size;
                             process_tile(final_tile_request,
                                          hfa_desc->_compiled_final_tile_model,
                                          present_key_tensor,
