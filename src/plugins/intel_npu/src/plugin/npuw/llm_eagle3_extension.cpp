@@ -113,9 +113,11 @@ struct KVCacheSegment {
     uint32_t length;     ///< Number of consecutive accepted tokens
 };
 
-void pad_hidden_state_input(const ov::SoPtr<ov::ITensor>& hidden_state,
-                            const ov::SoPtr<ov::ITensor>& padded_hidden_state,
-                            bool left_aligned = false) {
+}  // namespace
+
+void ov::npuw::util::pad_eagle3_hidden_state(const ov::SoPtr<ov::ITensor>& hidden_state,
+                                             const ov::SoPtr<ov::ITensor>& padded_hidden_state,
+                                             bool left_aligned) {
     // Pad the token_length dimension of hidden state input [batch, token_length, embedding_size].
     // Caller guarantees both tensors are rank-3 with batch=1 (validated in store_user_inputs).
     constexpr size_t kTokenDim = 1;
@@ -137,6 +139,23 @@ void pad_hidden_state_input(const ov::SoPtr<ov::ITensor>& hidden_state,
         ov::npuw::util::copy_to_right(hidden_state, padded_hidden_state);
     }
 }
+
+void ov::npuw::util::copy_eagle3_chunk_output(const ov::SoPtr<ov::ITensor>& chunk_output,
+                                              const ov::SoPtr<ov::ITensor>& accumulated_output,
+                                              uint32_t chunk_token_count,
+                                              uint32_t accumulated_offset) {
+    constexpr uint32_t seq_dim = 1;
+    auto chunk_output_slice = make_tensor_slice(chunk_output, seq_dim, 0u, chunk_token_count);
+    auto target_slice = make_tensor_slice(accumulated_output,
+                                          seq_dim,
+                                          accumulated_offset,
+                                          accumulated_offset + chunk_token_count);
+    NPUW_ASSERT(target_slice._ptr &&
+                "null slice of last_hidden_state tensor — source tensor may be uninitialized or have wrong shape");
+    chunk_output_slice->copy_to(target_slice._ptr);
+}
+
+namespace {
 
 void pad_tree_mask_input(const ov::SoPtr<ov::ITensor>& tree_mask, const ov::SoPtr<ov::ITensor>& padded_tree_mask) {
     // Pad the tree mask tensor [batch, 1, input_size, kvcache_size].
@@ -232,7 +251,7 @@ void Eagle3Extension::prepare_inputs(const std::shared_ptr<ov::IAsyncInferReques
         OPENVINO_ASSERT(m_hidden_states, "Eagle3 Draft model requires hidden_states tensor to be provided by user");
 
         auto padded_hidden_states = request->get_tensor(hidden_states_it->second);
-        pad_hidden_state_input(m_hidden_states, padded_hidden_states);
+        util::pad_eagle3_hidden_state(m_hidden_states, padded_hidden_states);
         LOG_VERB("Eagle3: Set hidden_states input tensor");
     }
 }
@@ -293,22 +312,9 @@ void Eagle3Extension::accumulate_chunk_last_hidden_state(
                     "Can't write chunk by stored chunked sequence offset and requested number of tokens, as it will "
                     "exceed pre-allocated size");
 
-    // Chunked prefill outputs are left-aligned with padding on the right.
-    constexpr uint32_t seq_dim = 1;
-    const uint32_t chunk_start_offset = 0u;
+    util::copy_eagle3_chunk_output(chunk_output, m_last_hidden_state, chunk_token_count, m_chunked_seq_offset);
 
-    auto chunk_output_slice = util::make_tensor_slice(chunk_output, seq_dim, chunk_start_offset, chunk_token_count);
-
-    auto target_slice = util::make_tensor_slice(m_last_hidden_state,
-                                                seq_dim,
-                                                m_chunked_seq_offset,
-                                                m_chunked_seq_offset + chunk_token_count);
-
-    NPUW_ASSERT(target_slice._ptr &&
-                "null slice of last_hidden_state tensor — source tensor may be uninitialized or have wrong shape");
-    chunk_output_slice->copy_to(target_slice._ptr);
-
-    LOG_VERB("Eagle3: Copied chunk [" << chunk_start_offset << ":" << chunk_token_count << "] to position ["
+    LOG_VERB("Eagle3: Copied chunk [0:" << chunk_token_count << "] to position ["
                                       << m_chunked_seq_offset << ":" << (m_chunked_seq_offset + chunk_token_count)
                                       << "], " << chunk_token_count << " tokens");
 
@@ -359,7 +365,7 @@ void Eagle3Extension::prepare_inputs_for_chunk(
     // Create tensor slice for current chunk along the sequence dimension
     auto chunk_tensor = util::make_tensor_slice(m_hidden_states, seq_dim, chunk_start_token, chunk_end_token);
 
-    pad_hidden_state_input(chunk_tensor, padded_tensor, true);
+    util::pad_eagle3_hidden_state(chunk_tensor, padded_tensor, true);
     LOG_VERB("Eagle3 Draft: Set hidden_states chunk [" << chunk_start_token << ":" << chunk_end_token
                                                        << "] for chunk processing");
 }
