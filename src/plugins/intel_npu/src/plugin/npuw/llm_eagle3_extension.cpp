@@ -134,7 +134,6 @@ void pad_hidden_state_input(const ov::SoPtr<ov::ITensor>& hidden_state,
                     hidden_state->get_byte_size(),
                     reinterpret_cast<uint8_t*>(padded_hidden_state->data()));
     } else {
-        // Whole-prefill and generate inputs retain the established right alignment.
         ov::npuw::util::copy_to_right(hidden_state, padded_hidden_state);
     }
 }
