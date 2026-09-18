@@ -81,20 +81,11 @@ void ov::npuw::EmbeddingInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITenso
     while (remaining_prompts > 0) {
         auto current_prompts_len = std::min(remaining_prompts, chunk_prompt_len);
 
-        // Populate the attention mask for the present chunk
-        // For the already processed tokens, they will be added into the attention mask after inference call
-        if (current_prompts_len < chunk_prompt_len) {
-            size_t last_chunk_offset = m_attn_mask_in_tensor->get_size() - chunk_prompt_len;
-
-            // We will populate current_prompts_len on the right side of attention mask for the processing tokens
-            // If the current prompt length is smaller than the chunk prompt length,
-            // clear the last chunk of the attention mask to ensure non-relevant tokens are masked
-            ov::npuw::util::fill_tensor<int64_t>(m_attn_mask_in_tensor, 0, last_chunk_offset);
-        }
+        ov::npuw::util::fill_tensor<int64_t>(m_attn_mask_in_tensor, 0, kvcache_desc.num_stored_tokens);
 
         std::copy_n(attention_mask->data<int64_t>() + kvcache_desc.num_stored_tokens,
                     current_prompts_len,
-                    m_attn_mask_in_tensor->data<int64_t>() + m_attn_mask_in_tensor->get_size() - current_prompts_len);
+                    m_attn_mask_in_tensor->data<int64_t>() + kvcache_desc.num_stored_tokens);
 
         const auto current_prefill_bytes = current_prompts_len * input_ids_elem_size;
         const auto prefilled_bytes = kvcache_desc.num_stored_tokens * input_ids_elem_size;
@@ -102,8 +93,7 @@ void ov::npuw::EmbeddingInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITenso
         ov::npuw::util::fill_tensor_bytes(m_input_ids_in_tensor, 0u);
         std::copy_n(reinterpret_cast<uint8_t*>(input_ids->data()) + prefilled_bytes,
                     current_prefill_bytes,
-                    reinterpret_cast<uint8_t*>(m_input_ids_in_tensor->data()) + m_input_ids_in_tensor->get_byte_size() -
-                        current_prefill_bytes);
+                    reinterpret_cast<uint8_t*>(m_input_ids_in_tensor->data()));
 
         auto last_dim = position_ids->get_shape().size() - 1;
         auto actual_position_ids_slice = ov::npuw::util::make_tensor_slice(
@@ -112,25 +102,27 @@ void ov::npuw::EmbeddingInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITenso
             kvcache_desc.num_stored_tokens,
             kvcache_desc.num_stored_tokens + static_cast<uint32_t>(current_prompts_len));
 
-        auto pos_ids_slice =
-            ov::npuw::util::make_tensor_slice(m_pos_ids_in_tensor,
-                                              static_cast<uint32_t>(last_dim),
-                                              static_cast<uint32_t>(chunk_prompt_len - current_prompts_len),
-                                              static_cast<uint32_t>(chunk_prompt_len));
+        ov::npuw::util::fill_tensor<int64_t>(m_pos_ids_in_tensor, 0);
+        auto pos_ids_slice = ov::npuw::util::make_tensor_slice(m_pos_ids_in_tensor,
+                                                               static_cast<uint32_t>(last_dim),
+                                                               0u,
+                                                               static_cast<uint32_t>(current_prompts_len));
 
         // Copy with proper stride handling
         NPUW_ASSERT(pos_ids_slice._ptr &&
                     "null slice of position IDs tensor — source tensor may be uninitialized or have wrong shape");
         actual_position_ids_slice->copy_to(pos_ids_slice._ptr);
 
-        m_prefill_base_request->update_history_size(kvcache_desc.num_stored_tokens);
+        if (m_prefill_base_request) {
+            m_prefill_base_request->update_history_size(kvcache_desc.num_stored_tokens);
+        }
 
         m_prefill_request->infer();
 
         auto src = ov::npuw::util::make_tensor_slice(output_tensor,
                                                      layer_ids::INPUT_IDS_SEQ_LEN_DIM,
-                                                     static_cast<uint32_t>(chunk_prompt_len - current_prompts_len),
-                                                     static_cast<uint32_t>(chunk_prompt_len));
+                                                     0u,
+                                                     static_cast<uint32_t>(current_prompts_len));
 
         auto dst = ov::npuw::util::make_tensor_slice(
             m_prefill_output,
@@ -156,12 +148,8 @@ void ov::npuw::EmbeddingInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITenso
                            m_prefill_in_ports,
                            m_prefill_out_ports,
                            static_cast<uint32_t>(current_prompts_len),
-                           kvcache_desc.v_tensors_transposed_pre);
-
-        // Update attention mask for the next iteration
-        std::copy_n(m_attn_mask_in_tensor->data<int64_t>() + m_attn_mask_in_tensor->get_size() - current_prompts_len,
-                    current_prompts_len,
-                    m_attn_mask_in_tensor->data<int64_t>() + kvcache_desc.num_stored_tokens - current_prompts_len);
+                           kvcache_desc.v_tensors_transposed_pre,
+                           true);
     }
 
     LOG_DEBUG("Done.");

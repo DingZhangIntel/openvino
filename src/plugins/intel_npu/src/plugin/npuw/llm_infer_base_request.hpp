@@ -52,7 +52,8 @@ protected:
                                     const PortsMap& in_ports,
                                     const PortsMap& out_ports,
                                     uint32_t num_tokens,
-                                    bool v_transposed);
+                                    bool v_transposed,
+                                    bool left_aligned = false);
     void init_tensor(const ov::Output<const ov::Node>& port);
     void init_ports();
 

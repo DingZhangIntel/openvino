@@ -163,6 +163,7 @@ target_sources(${TARGET_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/gqa_compiled_model_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/llm_continuation_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/llm_continued_prefill_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/npuw/embedding_infer_request_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/stored_tokens_state_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/llm_infer_request_variant_switch_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/llm_infer_request_port_names_test.cpp
