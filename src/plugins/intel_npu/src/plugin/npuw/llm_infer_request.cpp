@@ -137,7 +137,7 @@ size_t count_visual_tokens_before(const ov::SoPtr<ov::ITensor>& mask, size_t seq
 }
 
 // Scatters the compact deepstack_visual_embeds tensor (one row per visual token, in
-// visual-token order) into the right-aligned static destination at the actual
+// visual-token order) into the static destination at the actual
 // visual-token sequence positions described by visual_pos_masks.
 //
 // After the DeepStack gather/scatter cluster is replaced in the graph by a plain

@@ -134,7 +134,6 @@ void pad_hidden_state_input(const ov::SoPtr<ov::ITensor>& hidden_state,
                     hidden_state->get_byte_size(),
                     reinterpret_cast<uint8_t*>(padded_hidden_state->data()));
     } else {
-        // Whole-prefill and generate inputs retain the established right alignment.
         ov::npuw::util::copy_to_right(hidden_state, padded_hidden_state);
     }
 }
@@ -298,7 +297,7 @@ void Eagle3Extension::accumulate_chunk_last_hidden_state(
     constexpr uint32_t seq_dim = 1;
     const uint32_t chunk_start_offset = 0u;
 
-    auto chunk_output_slice = util::make_tensor_slice(chunk_output, seq_dim, chunk_start_offset, chunk_seq_len);
+    auto chunk_output_slice = util::make_tensor_slice(chunk_output, seq_dim, chunk_start_offset, chunk_token_count);
 
     auto target_slice = util::make_tensor_slice(m_last_hidden_state,
                                                 seq_dim,
@@ -309,7 +308,7 @@ void Eagle3Extension::accumulate_chunk_last_hidden_state(
                 "null slice of last_hidden_state tensor — source tensor may be uninitialized or have wrong shape");
     chunk_output_slice->copy_to(target_slice._ptr);
 
-    LOG_VERB("Eagle3: Copied chunk [" << chunk_start_offset << ":" << chunk_seq_len << "] to position ["
+    LOG_VERB("Eagle3: Copied chunk [" << chunk_start_offset << ":" << chunk_token_count << "] to position ["
                                       << m_chunked_seq_offset << ":" << (m_chunked_seq_offset + chunk_token_count)
                                       << "], " << chunk_token_count << " tokens");
 
