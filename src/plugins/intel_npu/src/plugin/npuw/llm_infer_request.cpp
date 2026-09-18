@@ -801,7 +801,8 @@ void ov::npuw::LLMInferRequest::update_kvcache_for(
     const std::unordered_map<std::string, ov::Output<const ov::Node>>& in_ports,
     const std::unordered_map<std::string, ov::Output<const ov::Node>>& out_ports,
     uint32_t num_tokens,
-    bool v_transposed) {
+    bool v_transposed,
+    bool left_aligned) {
     namespace uu = ov::npuw::util;
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
 
@@ -832,7 +833,7 @@ void ov::npuw::LLMInferRequest::update_kvcache_for(
         if (src_seq_len > num_tokens) {
             const bool is_chunked_prefill =
                 m_npuw_llm_compiled_model->m_use_chunk_prefill && request == m_prefill_request;
-            const uint32_t src_start = is_chunked_prefill ? 0u : src_seq_len - num_tokens;
+            const uint32_t src_start = left_aligned || is_chunked_prefill ? 0u : src_seq_len - num_tokens;
             auto src_slice = uu::make_tensor_slice(src_tensor, kv_dim, src_start, src_start + num_tokens);
             uu::copy_tensor_by_dim(src_slice, dst_slice, kv_dim, kv_dim);
         } else {

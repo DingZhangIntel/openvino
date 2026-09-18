@@ -59,7 +59,8 @@ protected:
                             const PortsMap& in_ports,
                             const PortsMap& out_ports,
                             uint32_t num_tokens,
-                            bool v_transposed) override;
+                            bool v_transposed,
+                            bool left_aligned = false) override;
     void copy_lincache(std::shared_ptr<ov::IAsyncInferRequest> from_request,
                        std::shared_ptr<ov::IAsyncInferRequest> to_request,
                        const std::unordered_map<std::string, ov::Output<const ov::Node>>& from_ports,

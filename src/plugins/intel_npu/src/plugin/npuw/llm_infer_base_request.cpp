@@ -15,7 +15,8 @@ void ov::npuw::LLMInferBaseRequest::update_kvcache_for(
     const std::unordered_map<std::string, ov::Output<const ov::Node>>& in_ports,
     const std::unordered_map<std::string, ov::Output<const ov::Node>>& out_ports,
     uint32_t num_tokens,
-    bool v_transposed) {
+    bool v_transposed,
+    bool left_aligned) {
     namespace uu = ov::npuw::util;
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
     auto& compiled = request->get_compiled_model();
@@ -41,7 +42,8 @@ void ov::npuw::LLMInferBaseRequest::update_kvcache_for(
         uint32_t src_seq_len = static_cast<uint32_t>(src_tensor->get_shape()[kv_dim]);
         OPENVINO_ASSERT(num_tokens <= src_seq_len);
         if (src_seq_len > num_tokens) {
-            auto src_slice = uu::make_tensor_slice(src_tensor, kv_dim, src_seq_len - num_tokens, src_seq_len);
+            const uint32_t src_start = left_aligned ? 0u : src_seq_len - num_tokens;
+            auto src_slice = uu::make_tensor_slice(src_tensor, kv_dim, src_start, src_start + num_tokens);
             uu::copy_tensor_by_dim(src_slice, dst_slice, kv_dim, kv_dim);
         } else {
             uu::copy_tensor_by_dim(src_tensor, dst_slice, kv_dim, kv_dim);
