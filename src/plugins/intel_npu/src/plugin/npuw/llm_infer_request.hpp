@@ -32,6 +32,14 @@ struct LLMContinuedPrefillTestAccess;
 namespace ov {
 namespace npuw {
 
+namespace util {
+size_t scatter_deepstack_visual_embeds(const ov::SoPtr<ov::ITensor>& src,
+                                       const ov::SoPtr<ov::ITensor>& mask,
+                                       const ov::SoPtr<ov::ITensor>& dst,
+                                       size_t src_row_offset = 0,
+                                       bool left_aligned = false);
+}  // namespace util
+
 class LLMInferRequest : public ov::npuw::LLMInferBaseRequest {
 public:
     explicit LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCompiledModel>& compiled_model);
