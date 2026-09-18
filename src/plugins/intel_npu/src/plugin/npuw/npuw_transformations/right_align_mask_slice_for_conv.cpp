@@ -38,7 +38,7 @@ public:
     // This pass re-align the Slice operation to extract the right part of the mask,
     // that contains useful current tokens.
     OPENVINO_MATCHER_PASS_RTTI("ov::npuw::RightAlignMaskSliceForConvImpl");
-    explicit RightAlignMaskSliceForConvImpl() {
+    explicit RightAlignMaskSliceForConvImpl(const ov::Output<ov::Node>& position_ids = {}) {
         auto attention_mask = opp::wrap_type<ov::op::v0::Parameter>();
         auto attention_mask_slice = opp::wrap_type<ov::op::v8::Slice>(
             {attention_mask, opp::any_input(), opp::any_input(), opp::any_input(), opp::any_input()});
@@ -72,17 +72,25 @@ public:
 
             auto const_zero = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, 0);
             auto const_one = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, 1);
-            auto mask_shape_of = std::make_shared<ov::op::v3::ShapeOf>(matched_attention_mask);
-            auto mask_len = std::make_shared<ov::op::v8::Gather>(mask_shape_of, const_one, const_zero);
-            auto mask_len_rank_one = std::make_shared<ov::op::v0::Unsqueeze>(mask_len, const_zero);
             // 2nd argument to Slice is stop point:
             auto current_len = matched_attention_mask_slice->input(2).get_source_output().get_node_shared_ptr();
-            auto current_offset = std::make_shared<ov::op::v1::Subtract>(mask_len, current_len);
+            std::shared_ptr<ov::Node> current_offset;
+            std::shared_ptr<ov::Node> slice_end;
+            if (position_ids.get_node()) {
+                auto current_position = std::make_shared<ov::op::v8::Gather>(position_ids, const_zero, const_one);
+                current_offset = current_position;
+                slice_end = std::make_shared<ov::op::v1::Add>(current_position, current_len);
+            } else {
+                auto mask_shape_of = std::make_shared<ov::op::v3::ShapeOf>(matched_attention_mask);
+                auto mask_len = std::make_shared<ov::op::v8::Gather>(mask_shape_of, const_one, const_zero);
+                current_offset = std::make_shared<ov::op::v1::Subtract>(mask_len, current_len);
+                slice_end = std::make_shared<ov::op::v0::Unsqueeze>(mask_len, const_zero);
+            }
 
             auto const_one_rank_one = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{1}, 1);
             auto new_slice = std::make_shared<ov::op::v8::Slice>(matched_attention_mask,
                                                                  current_offset,
-                                                                 mask_len_rank_one,
+                                                                 slice_end,
                                                                  const_one_rank_one,
                                                                  const_one_rank_one);
             matched_attention_mask_unsqueeze->input(0).replace_source_output(new_slice);
@@ -102,6 +110,25 @@ bool ov::npuw::RightAlignMaskSliceForConv::run_on_model(const std::shared_ptr<ov
     ov::pass::Manager manager("right-align-mask-slice-for-conv");
     manager.set_per_pass_validation(true);
     manager.register_pass<RightAlignMaskSliceForConvImpl>();
+    manager.run_passes(model);
+    return true;
+}
+
+bool ov::npuw::CurrentChunkMaskSliceForConv::run_on_model(const std::shared_ptr<ov::Model>& model) {
+    const auto position_ids = std::find_if(model->get_parameters().begin(),
+                                           model->get_parameters().end(),
+                                           [](const std::shared_ptr<ov::op::v0::Parameter>& parameter) {
+                                               const auto& names = parameter->output(0).get_names();
+                                               return names.count("position_ids") != 0 ||
+                                                      parameter->get_friendly_name() == "position_ids";
+                                           });
+    if (position_ids == model->get_parameters().end()) {
+        return false;
+    }
+
+    ov::pass::Manager manager("current-chunk-mask-slice-for-conv");
+    manager.set_per_pass_validation(true);
+    manager.register_pass<RightAlignMaskSliceForConvImpl>((*position_ids)->output(0));
     manager.run_passes(model);
     return true;
 }

@@ -946,6 +946,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     prefill_model->set_friendly_name(kvcache_model->get_friendly_name() + "_prefill");
 
     if (m_use_chunk_prefill && !m_is_embedding) {
+        LOG_DEBUG("Align attention_mask slice with the current prefill chunk for Conv operations: LFM-2 case.");
+        ov::npuw::CurrentChunkMaskSliceForConv().run_on_model(prefill_model);
         LOG_DEBUG("Right-align attention_mask slice for Conv operations in generate model: LFM-2 case.");
         ov::npuw::RightAlignMaskSliceForConv().run_on_model(kvcache_model);
     }
