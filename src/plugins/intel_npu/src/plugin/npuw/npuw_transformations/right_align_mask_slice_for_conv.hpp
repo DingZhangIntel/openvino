@@ -15,4 +15,10 @@ public:
     OPENVINO_MODEL_PASS_RTTI("ov::npuw::RightAlignMaskSliceForConv");
     bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
 };
+
+class CurrentChunkMaskSliceForConv : public ov::pass::ModelPass {
+public:
+    OPENVINO_MODEL_PASS_RTTI("ov::npuw::CurrentChunkMaskSliceForConv");
+    bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
+};
 }  // namespace ov::npuw
