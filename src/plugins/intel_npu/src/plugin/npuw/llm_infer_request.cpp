@@ -136,6 +136,8 @@ size_t count_visual_tokens_before(const ov::SoPtr<ov::ITensor>& mask, size_t seq
     return count;
 }
 
+}  // namespace
+
 // Scatters the compact deepstack_visual_embeds tensor (one row per visual token, in
 // visual-token order) into the static destination at the actual
 // visual-token sequence positions described by visual_pos_masks.
@@ -158,11 +160,11 @@ size_t count_visual_tokens_before(const ov::SoPtr<ov::ITensor>& mask, size_t seq
 //
 // Whole-prefill real tokens are right-aligned, while chunked-prefill real tokens are
 // left-aligned. The caller selects the corresponding destination offset.
-size_t scatter_deepstack_visual_embeds(const ov::SoPtr<ov::ITensor>& src,
-                                       const ov::SoPtr<ov::ITensor>& mask,
-                                       const ov::SoPtr<ov::ITensor>& dst,
-                                       size_t src_row_offset = 0,
-                                       bool left_aligned = false) {
+size_t ov::npuw::util::scatter_deepstack_visual_embeds(const ov::SoPtr<ov::ITensor>& src,
+                                                       const ov::SoPtr<ov::ITensor>& mask,
+                                                       const ov::SoPtr<ov::ITensor>& dst,
+                                                       size_t src_row_offset,
+                                                       bool left_aligned) {
     OPENVINO_ASSERT(dst);
     std::fill_n(reinterpret_cast<uint8_t*>(dst->data()), dst->get_byte_size(), 0);
 
@@ -214,6 +216,8 @@ size_t scatter_deepstack_visual_embeds(const ov::SoPtr<ov::ITensor>& src,
     }
     return k;
 }
+
+namespace {
 
 // Points the npuw_lr_cos/npuw_lr_sin model inputs the LongRoPE RoPE-cache rewrite
 // created (see RopeCacheMatcher, pre_compute.cpp) at the precomputed coefficient rows
@@ -1093,11 +1097,11 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                     seq_dim,
                     static_cast<uint32_t>(kvcache_desc.num_stored_tokens),
                     static_cast<uint32_t>(kvcache_desc.num_stored_tokens + current_prompts_len));
-                visual_tokens_scattered += scatter_deepstack_visual_embeds(deepstack_visual_embeds,
-                                                                           chunk_mask._ptr,
-                                                                           deepstack_local,
-                                                                           visual_tokens_scattered,
-                                                                           true);
+                visual_tokens_scattered += ov::npuw::util::scatter_deepstack_visual_embeds(deepstack_visual_embeds,
+                                                                                           chunk_mask._ptr,
+                                                                                           deepstack_local,
+                                                                                           visual_tokens_scattered,
+                                                                                           true);
             }
 
             if (m_eagle3_ext.is_eagle3_model()) {
@@ -1228,7 +1232,9 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
             OPENVINO_ASSERT(deepstack_visual_embeds && visual_pos_masks,
                             "deepstack_visual_embeds and visual_pos_masks must be provided for DeepStack VLM prefill.");
             auto deepstack_local = m_prefill_request->get_tensor(deepstack_it->second);
-            scatter_deepstack_visual_embeds(deepstack_visual_embeds, visual_pos_masks, deepstack_local);
+            ov::npuw::util::scatter_deepstack_visual_embeds(deepstack_visual_embeds,
+                                                            visual_pos_masks,
+                                                            deepstack_local);
         }
 
         if (m_eagle3_ext.is_eagle3_model()) {
