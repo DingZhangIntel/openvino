@@ -59,8 +59,8 @@ TEST(PerLayerInputsCopyTest, ChunkAtOffsetZeroCopiesToLeft) {
 }
 
 // Test 2: copy a middle chunk (offset=2, chunk=2) from a src with 6 tokens.
-// dst has 4 token slots; chunk fills the left 2 slots and clears the trailing slots.
-TEST(PerLayerInputsCopyTest, ChunkAtOffsetCopiesLeftAlignedAndClearsTrailingBytes) {
+// dst has 4 token slots; chunk fills the left 2 slots and leaves the trailing slots unchanged.
+TEST(PerLayerInputsCopyTest, ChunkAtOffsetCopiesLeftAligned) {
     // src: [1, 6, 2, 2], values 0..23
     auto src = make_per_layer_tensor(6, 2, 2, 0.f);
     // dst: [1, 4, 2, 2], sequential values starting from 99 (99, 100, 101, ...)
@@ -70,7 +70,7 @@ TEST(PerLayerInputsCopyTest, ChunkAtOffsetCopiesLeftAlignedAndClearsTrailingByte
 
     // src tokens at offset 2,3 -> src flat indices [8..15]
     const auto result = to_vec(dst);
-    // Left-aligned: dst tokens 0,1 hold src[2],src[3]; dst tokens 2,3 are cleared.
+    // Left-aligned: dst tokens 0,1 hold src[2],src[3].
     std::vector<float> expected = {8.f,
                                    9.f,
                                    10.f,
@@ -79,14 +79,14 @@ TEST(PerLayerInputsCopyTest, ChunkAtOffsetCopiesLeftAlignedAndClearsTrailingByte
                                    13.f,
                                    14.f,
                                    15.f,  // token 1
-                                   0.f,
-                                   0.f,
-                                   0.f,
-                                   0.f,  // cleared token 2
-                                   0.f,
-                                   0.f,
-                                   0.f,
-                                   0.f};  // cleared token 3
+                                   107.f,
+                                   108.f,
+                                   109.f,
+                                   110.f,  // unchanged token 2
+                                   111.f,
+                                   112.f,
+                                   113.f,
+                                   114.f};  // unchanged token 3
     EXPECT_EQ(result, expected);
 }
 
