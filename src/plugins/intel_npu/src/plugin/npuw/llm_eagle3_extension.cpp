@@ -113,11 +113,8 @@ struct KVCacheSegment {
     uint32_t length;     ///< Number of consecutive accepted tokens
 };
 
-}  // namespace
-
-void ov::npuw::util::pad_eagle3_hidden_state(const ov::SoPtr<ov::ITensor>& hidden_state,
-                                             const ov::SoPtr<ov::ITensor>& padded_hidden_state,
-                                             bool left_aligned) {
+void pad_hidden_state_input(const ov::SoPtr<ov::ITensor>& hidden_state,
+                            const ov::SoPtr<ov::ITensor>& padded_hidden_state) {
     // Pad the token_length dimension of hidden state input [batch, token_length, embedding_size].
     // Caller guarantees both tensors are rank-3 with batch=1 (validated in store_user_inputs).
     constexpr size_t kTokenDim = 1;
@@ -130,14 +127,26 @@ void ov::npuw::util::pad_eagle3_hidden_state(const ov::SoPtr<ov::ITensor>& hidde
     OPENVINO_ASSERT(dst_shape[kTokenDim] >= src_shape[kTokenDim], "Padded token length must be >= input token length");
 
     ov::npuw::util::fill_tensor_bytes(padded_hidden_state, 0u);
+    ov::npuw::util::copy_to_right(hidden_state, padded_hidden_state);
+}
 
-    if (left_aligned) {
-        std::copy_n(reinterpret_cast<const uint8_t*>(hidden_state->data()),
-                    hidden_state->get_byte_size(),
-                    reinterpret_cast<uint8_t*>(padded_hidden_state->data()));
-    } else {
-        ov::npuw::util::copy_to_right(hidden_state, padded_hidden_state);
-    }
+}  // namespace
+
+void ov::npuw::util::pad_eagle3_hidden_state_to_left(const ov::SoPtr<ov::ITensor>& hidden_state,
+                                                     const ov::SoPtr<ov::ITensor>& padded_hidden_state) {
+    constexpr size_t kTokenDim = 1;
+    constexpr size_t kEmbedDim = 2;
+
+    const auto& src_shape = hidden_state->get_shape();
+    const auto& dst_shape = padded_hidden_state->get_shape();
+
+    OPENVINO_ASSERT(dst_shape[kEmbedDim] == src_shape[kEmbedDim], "Embedding size must match");
+    OPENVINO_ASSERT(dst_shape[kTokenDim] >= src_shape[kTokenDim], "Padded token length must be >= input token length");
+
+    fill_tensor_bytes(padded_hidden_state, 0u);
+    std::copy_n(reinterpret_cast<const uint8_t*>(hidden_state->data()),
+                hidden_state->get_byte_size(),
+                reinterpret_cast<uint8_t*>(padded_hidden_state->data()));
 }
 
 void ov::npuw::util::copy_eagle3_chunk_output(const ov::SoPtr<ov::ITensor>& chunk_output,
@@ -251,7 +260,7 @@ void Eagle3Extension::prepare_inputs(const std::shared_ptr<ov::IAsyncInferReques
         OPENVINO_ASSERT(m_hidden_states, "Eagle3 Draft model requires hidden_states tensor to be provided by user");
 
         auto padded_hidden_states = request->get_tensor(hidden_states_it->second);
-        util::pad_eagle3_hidden_state(m_hidden_states, padded_hidden_states);
+        pad_hidden_state_input(m_hidden_states, padded_hidden_states);
         LOG_VERB("Eagle3: Set hidden_states input tensor");
     }
 }
@@ -365,7 +374,7 @@ void Eagle3Extension::prepare_inputs_for_chunk(
     // Create tensor slice for current chunk along the sequence dimension
     auto chunk_tensor = util::make_tensor_slice(m_hidden_states, seq_dim, chunk_start_token, chunk_end_token);
 
-    util::pad_eagle3_hidden_state(chunk_tensor, padded_tensor, true);
+    util::pad_eagle3_hidden_state_to_left(chunk_tensor, padded_tensor);
     LOG_VERB("Eagle3 Draft: Set hidden_states chunk [" << chunk_start_token << ":" << chunk_end_token
                                                        << "] for chunk processing");
 }

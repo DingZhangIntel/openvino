@@ -32,9 +32,8 @@ bool matchEagle3HiddenStatesString(const std::string& input);
 bool matchEagle3TreeMaskString(const std::string& input);
 
 namespace util {
-void pad_eagle3_hidden_state(const ov::SoPtr<ov::ITensor>& hidden_state,
-                             const ov::SoPtr<ov::ITensor>& padded_hidden_state,
-                             bool left_aligned = false);
+void pad_eagle3_hidden_state_to_left(const ov::SoPtr<ov::ITensor>& hidden_state,
+                                     const ov::SoPtr<ov::ITensor>& padded_hidden_state);
 void copy_eagle3_chunk_output(const ov::SoPtr<ov::ITensor>& chunk_output,
                               const ov::SoPtr<ov::ITensor>& accumulated_output,
                               uint32_t chunk_token_count,
