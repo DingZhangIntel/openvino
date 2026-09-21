@@ -523,11 +523,9 @@ TEST_F(LLMContinuedPrefillTest, ShortTailChunkKeepsInputsAndKvSourceLeftAligned)
     auto position_ids = LLMContinuedPrefillTestAccess::prefill_position_ids(req);
     ASSERT_EQ(position_ids->get_size(), 32u);
     EXPECT_EQ(position_ids->data<int64_t>()[0], last_token_position);
-    EXPECT_TRUE(std::all_of(position_ids->data<int64_t>() + 1,
-                            position_ids->data<int64_t>() + position_ids->get_size(),
-                            [](int64_t value) {
-                                return value == 0;
-                            }));
+    for (size_t index = 1; index < position_ids->get_size(); ++index) {
+        EXPECT_EQ(position_ids->data<int64_t>()[index], 32 + index);
+    }
 
     auto attention_mask = LLMContinuedPrefillTestAccess::prefill_attention_mask(req);
     ASSERT_GE(attention_mask->get_size(), prompt_len);
