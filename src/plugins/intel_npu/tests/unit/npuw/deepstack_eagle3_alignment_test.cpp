@@ -22,10 +22,10 @@ TEST(DeepStackAlignmentTest, PartialChunkUsesLeftPositionsAndContinuesVisualRows
     std::copy(mask_values.begin(), mask_values.end(), mask.data<int64_t>());
     ov::Tensor destination(ov::element::f32, ov::Shape{1, 4, 1});
 
-    const auto scattered = ov::npuw::util::scatter_deepstack_visual_embeds_to_left(ov::get_tensor_impl(source),
-                                                                                   ov::get_tensor_impl(mask),
-                                                                                   ov::get_tensor_impl(destination),
-                                                                                   1u);
+    const auto scattered = ov::npuw::util::scatter_deepstack_visual_embeds(ov::get_tensor_impl(source),
+                                                                           ov::get_tensor_impl(mask),
+                                                                           ov::get_tensor_impl(destination),
+                                                                           1u);
 
     EXPECT_EQ(scattered, 2u);
     EXPECT_FLOAT_EQ(destination.data<float>()[0], 20.f);
@@ -40,8 +40,7 @@ TEST(Eagle3AlignmentTest, PartialDraftHiddenStateUsesLeftRows) {
     source.data<float>()[1] = 20.f;
     ov::Tensor destination(ov::element::f32, ov::Shape{1, 4, 1});
 
-    ov::npuw::util::pad_eagle3_hidden_state_to_left(ov::get_tensor_impl(source),
-                                                    ov::get_tensor_impl(destination));
+    ov::npuw::util::pad_eagle3_hidden_state(ov::get_tensor_impl(source), ov::get_tensor_impl(destination));
 
     EXPECT_FLOAT_EQ(destination.data<float>()[0], 10.f);
     EXPECT_FLOAT_EQ(destination.data<float>()[1], 20.f);
