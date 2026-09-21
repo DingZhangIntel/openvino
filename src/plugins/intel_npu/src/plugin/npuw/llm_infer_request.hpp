@@ -33,10 +33,10 @@ namespace ov {
 namespace npuw {
 
 namespace util {
-size_t scatter_deepstack_visual_embeds_to_left(const ov::SoPtr<ov::ITensor>& src,
-                                               const ov::SoPtr<ov::ITensor>& mask,
-                                               const ov::SoPtr<ov::ITensor>& dst,
-                                               size_t src_row_offset = 0);
+size_t scatter_deepstack_visual_embeds(const ov::SoPtr<ov::ITensor>& src,
+                                       const ov::SoPtr<ov::ITensor>& mask,
+                                       const ov::SoPtr<ov::ITensor>& dst,
+                                       size_t src_row_offset = 0);
 }  // namespace util
 
 class LLMInferRequest : public ov::npuw::LLMInferBaseRequest {
@@ -58,8 +58,7 @@ protected:
                             const PortsMap& in_ports,
                             const PortsMap& out_ports,
                             uint32_t num_tokens,
-                            bool v_transposed,
-                            bool left_aligned = false) override;
+                            bool v_transposed) override;
     void copy_lincache(std::shared_ptr<ov::IAsyncInferRequest> from_request,
                        std::shared_ptr<ov::IAsyncInferRequest> to_request,
                        const std::unordered_map<std::string, ov::Output<const ov::Node>>& from_ports,

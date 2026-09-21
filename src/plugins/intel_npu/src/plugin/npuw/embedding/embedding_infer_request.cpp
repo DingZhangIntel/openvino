@@ -148,8 +148,7 @@ void ov::npuw::EmbeddingInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITenso
                            m_prefill_in_ports,
                            m_prefill_out_ports,
                            static_cast<uint32_t>(current_prompts_len),
-                           kvcache_desc.v_tensors_transposed_pre,
-                           true);
+                           kvcache_desc.v_tensors_transposed_pre);
     }
 
     LOG_DEBUG("Done.");

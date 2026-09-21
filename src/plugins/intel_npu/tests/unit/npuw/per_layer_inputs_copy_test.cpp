@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include <numeric>
+
 #include "infer_request_utils.hpp"
 #include "openvino/runtime/make_tensor.hpp"
 #include "util.hpp"
@@ -140,45 +142,58 @@ TEST(PerLayerInputsCopyTest, PerTokenByteMismatchThrows) {
     EXPECT_ANY_THROW(ov::npuw::util::copy_per_layer_inputs_chunk_to_left(src, dst, /*offset=*/0, /*chunk=*/2));
 }
 
-// --- copy_to_right for per_layer_inputs (inlined path tests) --------------------
+// --- copy_to_left for whole-prefill/generate paths ------------------------------
 
-// Test 9: copy_to_right writes src into the right end of dst; leading bytes are left unchanged.
-TEST(PerLayerInputsCopyTest, CopyToRightLeavesLeadingBytesUnchanged) {
+// Test 9: copy_to_left writes src into the left end of dst; trailing bytes are left unchanged.
+TEST(PerLayerInputsCopyTest, CopyToLeftLeavesTrailingBytesUnchanged) {
     // src: [1, 2, 2, 2], values 0..7
     auto src = make_per_layer_tensor(2, 2, 2, 0.f);
     // dst: [1, 4, 2, 2], sequential values starting from 99 (99, 100, 101, ...)
     auto dst = make_per_layer_tensor(4, 2, 2, 99.f);
 
-    ASSERT_NO_THROW(ov::npuw::util::copy_to_right(src, dst));
+    ASSERT_NO_THROW(ov::npuw::util::copy_to_left(src, dst));
 
     const auto result = to_vec(dst);
-    std::vector<float> expected = {99.f,
-                                   100.f,
-                                   101.f,
-                                   102.f,  // unchanged (token 0)
-                                   103.f,
-                                   104.f,
-                                   105.f,
-                                   106.f,  // unchanged (token 1)
-                                   0.f,
+    std::vector<float> expected = {0.f,
                                    1.f,
                                    2.f,
                                    3.f,  // src token 0
                                    4.f,
                                    5.f,
                                    6.f,
-                                   7.f};  // src token 1
+                                   7.f,  // src token 1
+                                   107.f,
+                                   108.f,
+                                   109.f,
+                                   110.f,  // unchanged (token 2)
+                                   111.f,
+                                   112.f,
+                                   113.f,
+                                   114.f};  // unchanged (token 3)
     EXPECT_EQ(result, expected);
 }
 
-// Test 10: copy_to_right when src size == dst size copies everything.
-TEST(PerLayerInputsCopyTest, CopyToRightSameSizeCopiesAll) {
+// Test 10: copy_to_left when src size == dst size copies everything.
+TEST(PerLayerInputsCopyTest, CopyToLeftSameSizeCopiesAll) {
     auto src = make_per_layer_tensor(2, 2, 2, 1.f);
     auto dst = make_per_layer_tensor(2, 2, 2, 0.f);
 
-    ASSERT_NO_THROW(ov::npuw::util::copy_to_right(src, dst));
+    ASSERT_NO_THROW(ov::npuw::util::copy_to_left(src, dst));
 
     EXPECT_EQ(to_vec(dst), to_vec(src));
+}
+
+TEST(InferRequestUtilsTest, PositionIdsAreLeftAlignedForEveryPlane) {
+    ov::Tensor source(ov::element::i64, ov::Shape{3, 1, 2});
+    ov::Tensor destination(ov::element::i64, ov::Shape{3, 1, 4});
+    std::iota(source.data<int64_t>(), source.data<int64_t>() + source.get_size(), 1);
+    std::fill_n(destination.data<int64_t>(), destination.get_size(), 99);
+
+    ov::npuw::util::pad_position_ids(ov::get_tensor_impl(destination), ov::get_tensor_impl(source));
+
+    const std::vector<int64_t> expected{1, 2, 99, 99, 3, 4, 99, 99, 5, 6, 99, 99};
+    EXPECT_EQ(std::vector<int64_t>(destination.data<int64_t>(), destination.data<int64_t>() + destination.get_size()),
+              expected);
 }
 
 }  // namespace
