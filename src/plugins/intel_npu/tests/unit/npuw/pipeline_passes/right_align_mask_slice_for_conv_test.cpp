@@ -118,13 +118,21 @@ std::shared_ptr<ov::op::v1::VariadicSplit> add_conv_mask_chain(
 std::shared_ptr<ov::Model> build_lfm2_conv_mask_model(const ov::PartialShape& mask_shape,
                                                       int64_t seq_len,
                                                       const std::string& mask_name = "attention_mask",
-                                                      int num_conv_layers = 1) {
+                                                      int num_conv_layers = 1,
+                                                      bool add_position_ids = false) {
     auto attention_mask = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, mask_shape);
     attention_mask->output(0).set_names({mask_name});
     attention_mask->set_friendly_name(mask_name);
 
     ov::ResultVector results;
     ov::ParameterVector params{attention_mask};
+    if (add_position_ids) {
+        auto position_ids =
+            std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{1, seq_len});
+        position_ids->output(0).set_names({"position_ids"});
+        position_ids->set_friendly_name("position_ids");
+        params.push_back(position_ids);
+    }
     for (int i = 0; i < num_conv_layers; ++i) {
         add_conv_mask_chain(attention_mask, seq_len, std::to_string(i), results, params);
     }
@@ -223,6 +231,51 @@ TEST(RightAlignMaskSliceForConvTest, ComputesRightAlignedBounds) {
     EXPECT_EQ(step[0], 1);
     ASSERT_EQ(axis.size(), 1u);
     EXPECT_EQ(axis[0], 1) << "slice must operate on the sequence axis";
+}
+
+TEST(RightAlignMaskSliceForConvTest, CurrentChunkStartsAtFirstPositionId) {
+    constexpr int64_t mask_len = 64;
+    constexpr int64_t seq_len = 32;
+    constexpr int64_t past_len = 32;
+    auto model = build_lfm2_conv_mask_model(ov::PartialShape{1, mask_len},
+                                            seq_len,
+                                            "attention_mask",
+                                            1,
+                                            true);
+
+    ASSERT_TRUE(ov::npuw::CurrentChunkMaskSliceForConv().run_on_model(model));
+    ov::pass::ConstantFolding().run_on_model(model);
+
+    auto unsqueeze = get_node_by_name(model, "mask_unsqueeze_0");
+    ASSERT_NE(unsqueeze, nullptr);
+    auto current_chunk_slice = unsqueeze->input_value(0).get_node_shared_ptr();
+    ASSERT_EQ(std::string(current_chunk_slice->get_type_name()), "Slice");
+    EXPECT_EQ(std::string(current_chunk_slice->input_value(1).get_node_shared_ptr()->get_type_name()), "Gather");
+    EXPECT_EQ(std::string(current_chunk_slice->input_value(2).get_node_shared_ptr()->get_type_name()), "Add");
+
+    auto attention_mask = model->input("attention_mask");
+    auto position_ids = model->input("position_ids");
+    auto slice_model = std::make_shared<ov::Model>(
+        ov::ResultVector{std::make_shared<ov::op::v0::Result>(current_chunk_slice)},
+        ov::ParameterVector{ov::as_type_ptr<ov::op::v0::Parameter>(attention_mask.get_node_shared_ptr()),
+                            ov::as_type_ptr<ov::op::v0::Parameter>(position_ids.get_node_shared_ptr())});
+
+    ov::Tensor mask_tensor(ov::element::i64, ov::Shape{1, mask_len});
+    std::fill_n(mask_tensor.data<int64_t>(), past_len + 1, int64_t{1});
+    std::fill_n(mask_tensor.data<int64_t>() + past_len + 1, seq_len - 1, int64_t{0});
+    ov::Tensor position_tensor(ov::element::i64, ov::Shape{1, seq_len});
+    std::fill_n(position_tensor.data<int64_t>(), position_tensor.get_size(), int64_t{0});
+    position_tensor.data<int64_t>()[0] = past_len;
+    ov::Tensor output_tensor(ov::element::i64, ov::Shape{1, seq_len});
+
+    ASSERT_TRUE(slice_model->evaluate(ov::TensorVector{output_tensor},
+                                      ov::TensorVector{mask_tensor, position_tensor}));
+    EXPECT_EQ(output_tensor.data<int64_t>()[0], 1);
+    EXPECT_TRUE(std::all_of(output_tensor.data<int64_t>() + 1,
+                            output_tensor.data<int64_t>() + output_tensor.get_size(),
+                            [](int64_t value) {
+                                return value == 0;
+                            }));
 }
 
 // Every conv layer that consumes attention_mask must be re-anchored (LFM2 has 10 of them).
