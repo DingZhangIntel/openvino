@@ -778,10 +778,7 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
             uu::copy_tensor_by_dim(prefill_present_kv_chunk, kvcache_last_kv_chunk, pre_kv_dim, gen_kv_dim);
         } else {
             auto prefill_out_slice =
-                uu::make_tensor_slice(prefill_out_tensor,
-                                      pre_kv_dim,
-                                      kvcache_desc.max_prompt_size - kvcache_desc.num_stored_tokens,
-                                      kvcache_desc.max_prompt_size);
+                uu::make_tensor_slice(prefill_out_tensor, pre_kv_dim, 0u, kvcache_desc.num_stored_tokens);
 
             auto kvcache_in_slice =
                 uu::make_tensor_slice(kvcache_in_tensor, gen_kv_dim, 0u, kvcache_desc.num_stored_tokens);
@@ -1031,10 +1028,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                 cache_context.restore_prefix_cache = false;
             }
 
-            // Populate the attention mask for the present chunk
-            // For the already processed tokens, they will be added into the attention mask after inference call
-            ov::npuw::util::fill_tensor<int64_t>(attn_mask_in_tensor, 0, kvcache_desc.num_stored_tokens);
-
+            // Append the present chunk to the attention mask initialized for this prefill.
             std::copy_n(attention_mask->data<int64_t>() + kvcache_desc.num_stored_tokens,
                         current_prompts_len,
                         attn_mask_in_tensor->data<int64_t>() + kvcache_desc.num_stored_tokens);
@@ -1122,11 +1116,13 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
             // Gemma4-26B-A4B MoE: token_type_ids is [BATCH, SEQ_LEN].
             if (has_token_type_ids) {
                 const size_t total_len = token_type_ids_in_tensor->get_size();
-                std::fill_n(token_type_ids_in_tensor->data<int64_t>(), total_len, int64_t{0});
                 const uint32_t token_type_src_offset = kvcache_desc.num_stored_tokens - m_continued_prefill_base;
                 std::copy_n(token_type_ids->data<int64_t>() + token_type_src_offset,
                             current_prompts_len,
                             token_type_ids_in_tensor->data<int64_t>());
+                std::fill(token_type_ids_in_tensor->data<int64_t>() + current_prompts_len,
+                          token_type_ids_in_tensor->data<int64_t>() + total_len,
+                          int64_t{0});
             }
 
             // Prepare KV blocks or bind memory for this chunk via strategy.
