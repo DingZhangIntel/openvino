@@ -39,6 +39,14 @@ struct LLMContinuedPrefillTestAccess {
         return req.m_npuw_llm_compiled_model->m_kvcache_desc;
     }
 
+    static ov::npuw::LLMCompiledModel::KVCacheDesc& mutable_desc(Request& req) {
+        return req.m_npuw_llm_compiled_model->m_kvcache_desc;
+    }
+
+    static void set_chunk_prefill(Request& req, bool enabled) {
+        req.m_npuw_llm_compiled_model->m_use_chunk_prefill = enabled;
+    }
+
     static const std::vector<std::string>& past_names(Request& req) {
         return req.m_kvcache_past_names;
     }
@@ -563,6 +571,40 @@ TEST_F(LLMContinuedPrefillTest, ShortTailChunkKeepsInputsAndKvSourceLeftAligned)
         auto last_token =
             ov::npuw::util::make_tensor_slice(generate, generate_seq_dim(name), last_token_position, prompt_len);
         EXPECT_EQ(materialize_bytes(last_token), expected_kv_bytes.at(name)) << name;
+    }
+}
+
+TEST_F(LLMContinuedPrefillTest, WholePrefillHandoffReadsLeftAlignedKvOutput) {
+    auto& req = request();
+    constexpr uint32_t prompt_len = 7u;
+    LLMContinuedPrefillTestAccess::set_chunk_prefill(req, false);
+    auto& desc = LLMContinuedPrefillTestAccess::mutable_desc(req);
+    desc.num_stored_tokens = prompt_len;
+    desc.max_prompt_size = 32u;
+
+    std::unordered_map<std::string, std::vector<uint8_t>> expected_kv_bytes;
+    uint8_t seed = 29u;
+    for (const auto& name : LLMContinuedPrefillTestAccess::past_names(req)) {
+        auto present = LLMContinuedPrefillTestAccess::prefill_present(req, name);
+        const auto seq_dim = prefill_seq_dim(name);
+        const auto seq_len = static_cast<uint32_t>(present->get_shape()[seq_dim]);
+        ASSERT_EQ(seq_len, desc.max_prompt_size);
+
+        auto live_prefix = ov::npuw::util::make_tensor_slice(present, seq_dim, 0u, prompt_len);
+        fill_tensor_pattern(live_prefix, seed);
+        expected_kv_bytes.emplace(name, materialize_bytes(live_prefix));
+
+        auto padded_tail = ov::npuw::util::make_tensor_slice(present, seq_dim, seq_len - prompt_len, seq_len);
+        fill_tensor_pattern(padded_tail, static_cast<uint8_t>(seed + 1u));
+        seed = static_cast<uint8_t>(seed + 31u);
+    }
+
+    LLMContinuedPrefillTestAccess::copy_kvcache(req);
+
+    for (const auto& name : LLMContinuedPrefillTestAccess::past_names(req)) {
+        auto generate = LLMContinuedPrefillTestAccess::generate_past(req, name);
+        auto live_prefix = ov::npuw::util::make_tensor_slice(generate, generate_seq_dim(name), 0u, prompt_len);
+        EXPECT_EQ(materialize_bytes(live_prefix), expected_kv_bytes.at(name)) << name;
     }
 }
 
