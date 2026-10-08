@@ -9,6 +9,10 @@
 #include "../llm_infer_base_request.hpp"
 #include "openvino/core/descriptor/output.hpp"
 
+namespace ov::test::npuw {
+struct EmbeddingInferRequestTestAccess;
+}
+
 namespace ov {
 namespace npuw {
 
@@ -30,6 +34,8 @@ protected:
     void infer_prefill(ov::SoPtr<ov::ITensor> input_ids, ov::SoPtr<ov::ITensor> attention_mask);
 
 private:
+    friend struct ov::test::npuw::EmbeddingInferRequestTestAccess;
+
     std::unordered_map<std::string, ov::Output<const ov::Node>> m_prefill_in_ports;
     std::unordered_map<std::string, ov::Output<const ov::Node>> m_prefill_out_ports;
     std::vector<ov::Output<const ov::Node>> m_prefill_past_kv_ports;
