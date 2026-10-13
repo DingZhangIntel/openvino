@@ -402,10 +402,8 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
         OPENVINO_ASSERT(m_lm_head_request);
         m_lm_head_embed_port = m_lm_head_request->get_inputs()[0];
         m_lm_head_logits_port = m_lm_head_request->get_outputs()[0];
-        if (!compiled_model->m_use_chunk_prefill) {
-            m_prefill_request->set_tensor(m_prefill_out_ports.at(layer_names::output_embeds),
-                                          m_lm_head_request->get_tensor(m_lm_head_embed_port));
-        }
+        m_prefill_request->set_tensor(m_prefill_out_ports.at(layer_names::output_embeds),
+                                      m_lm_head_request->get_tensor(m_lm_head_embed_port));
 
         // Set output_embeds tensor for all generate variants
         for (auto& generate_req : m_generate_requests) {
@@ -1127,6 +1125,10 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                           int64_t{0});
             }
 
+            set_logits_selection_indices(m_prefill_request,
+                                         m_prefill_in_ports,
+                                         static_cast<uint32_t>(current_prompts_len));
+
             // Prepare KV blocks or bind memory for this chunk via strategy.
             m_kvcache_strategy->on_prefill_chunk_begin(static_cast<uint32_t>(current_prompts_len));
         });
@@ -1229,6 +1231,10 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
             auto dst = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::per_layer_inputs));
             ov::npuw::util::copy_to_left(per_layer_inputs, dst);
         }
+
+        set_logits_selection_indices(m_prefill_request,
+                                     m_prefill_in_ports,
+                                     static_cast<uint32_t>(input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM]));
     });
 
     m_llm_profile["1/prefill:3b.infer"].record([&]() {
@@ -1241,38 +1247,25 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
     LOG_DEBUG("Done");
 }
 
-void ov::npuw::LLMInferRequest::copy_last_prefill_embeds_to_lm_head(uint32_t valid_token_count) {
-    OPENVINO_ASSERT(m_lm_head_request, "Shared LM-head request is not initialized.");
-    OPENVINO_ASSERT(valid_token_count > 0u, "Chunked prefill must produce at least one valid token.");
+void ov::npuw::LLMInferRequest::set_logits_selection_indices(const std::shared_ptr<ov::IAsyncInferRequest>& request,
+                                                             const PortsMap& in_ports,
+                                                             uint32_t valid_token_count) const {
+    const auto it = in_ports.find(ov::npuw::util::kLogitsSelectionIndicesParamName);
+    if (it == in_ports.end()) {
+        return;
+    }
 
-    auto prefill_embeds = m_prefill_request->get_tensor(m_prefill_out_ports.at(layer_names::output_embeds));
-    auto lm_head_embeds = m_lm_head_request->get_tensor(m_lm_head_embed_port);
-    const uint32_t batch_dim = m_npuw_llm_compiled_model->m_cfg.get<::intel_npu::NPUW_LLM_BATCH_DIM>();
-    OPENVINO_ASSERT(batch_dim <= 1u, "Shared LM-head supports only batch dimensions 0 or 1.");
+    OPENVINO_ASSERT(valid_token_count > 0u, "Logits selection requires at least one valid token.");
+    auto indices = request->get_tensor(it->second);
+    OPENVINO_ASSERT(indices->get_element_type() == ov::element::i64 && indices->get_shape().size() == 1u,
+                    "Logits selection indices must be a rank-1 i64 tensor.");
+    const uint32_t selected_token_count = static_cast<uint32_t>(indices->get_size());
+    OPENVINO_ASSERT(selected_token_count > 0u, "Logits selection indices must not be empty.");
 
-    const uint32_t sequence_dim = 1u - batch_dim;
-    const auto& prefill_shape = prefill_embeds->get_shape();
-    const auto& lm_head_shape = lm_head_embeds->get_shape();
-    OPENVINO_ASSERT(prefill_shape.size() == 3u && lm_head_shape.size() == 3u,
-                    "Shared LM-head embeddings must be rank-3 tensors.");
-    OPENVINO_ASSERT(prefill_embeds->get_element_type() == lm_head_embeds->get_element_type(),
-                    "Prefill and LM-head embedding types must match.");
-    OPENVINO_ASSERT(valid_token_count <= prefill_shape[sequence_dim],
-                    "Valid prefill tokens exceed the embedding output length.");
-
-    const uint32_t lm_head_token_count = static_cast<uint32_t>(lm_head_shape[sequence_dim]);
-    const uint32_t tokens_to_copy = std::min(valid_token_count, lm_head_token_count);
-    ov::npuw::util::fill_tensor_bytes(lm_head_embeds, 0u);
-
-    const auto prefill_slice = ov::npuw::util::make_tensor_slice(prefill_embeds,
-                                                                 sequence_dim,
-                                                                 valid_token_count - tokens_to_copy,
-                                                                 valid_token_count);
-    const auto lm_head_slice = ov::npuw::util::make_tensor_slice(lm_head_embeds,
-                                                                 sequence_dim,
-                                                                 lm_head_token_count - tokens_to_copy,
-                                                                 lm_head_token_count);
-    ov::npuw::util::copy_tensor_by_dim(prefill_slice, lm_head_slice, sequence_dim, sequence_dim);
+    auto* data = indices->data<int64_t>();
+    for (uint32_t index = 0; index < selected_token_count; ++index) {
+        data[index] = std::max<int64_t>(0, static_cast<int64_t>(valid_token_count) - selected_token_count + index);
+    }
 }
 
 void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
@@ -1339,9 +1332,6 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
 
     m_llm_profile["1/prefill:4.lm_head"].record([&]() {
         if (m_lm_head_request) {
-            if (use_chunk_prefill) {
-                copy_last_prefill_embeds_to_lm_head(static_cast<uint32_t>(m_tokens_in_present_chunk));
-            }
             LOG_DEBUG("Calling inference for LM head model.");
             m_lm_head_request->infer();
             m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
@@ -1547,6 +1537,8 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
             auto dst = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::per_layer_inputs));
             ov::npuw::util::copy_to_left(per_layer_inputs, dst);
         }
+
+        set_logits_selection_indices(m_kvcache_request, m_kvcache_in_ports, input_tokens_len);
     });
 
     m_llm_profile["N/generate:2.infer"].record([&]() {

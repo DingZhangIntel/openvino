@@ -22,14 +22,12 @@
 #include "npuw_transformations/lora_stateful_to_stateless.hpp"
 #include "npuw_transformations/optimize_value_tensors.hpp"
 #include "npuw_transformations/patch_sliding_window_mask.hpp"
-#include "npuw_transformations/propagate_slice.hpp"
 #include "npuw_transformations/remove_token_type_ids.hpp"
 #include "npuw_transformations/replace_deepstack_scatter_with_add.hpp"
 #include "npuw_transformations/reshape_sliced_head_to_static.hpp"
 #include "npuw_transformations/reshape_to_static.hpp"
 #include "npuw_transformations/right_align_mask_slice_for_conv.hpp"
 #include "npuw_transformations/select_last_chunk_logits.hpp"
-#include "npuw_transformations/slice_out_embeds.hpp"
 #include "npuw_transformations/split_kvcache_into_blocks.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/greater.hpp"
@@ -1057,33 +1055,31 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
 
     const bool is_per_layer_inputs_model = has_per_layer_inputs(prefill_model);
-    bool propagate_slice_up = m_cfg.get<::intel_npu::NPUW_LLM_PROPAGATE_SLICE_UP>();
+    if (m_cfg.get<::intel_npu::NPUW_LLM_PROPAGATE_SLICE_UP>()) {
+        LOG_WARN("NPUW_LLM_PROPAGATE_SLICE_UP is not applied to runtime logits Gather selection.");
+    }
 
     if (lm_head_model) {
-        LOG_DEBUG("Shared LM head: slice the prefill output");
-        // KVCache model is already reshaped to [1, max_generation_token_len, embed size],
-        // Gemma-4 E2B/E4B cross-group KV sharing models benefit the most from hoisting the slice
-        // through the SWA/Global boundary, so auto-enable this option for them unless the user
-        // explicitly configured it.
-        if (is_per_layer_inputs_model && !m_cfg.has<::intel_npu::NPUW_LLM_PROPAGATE_SLICE_UP>()) {
-            m_cfg.update({{"NPUW_LLM_PROPAGATE_SLICE_UP", "YES"}});
-            propagate_slice_up = true;
-            LOG_INFO("Gemma-4 cross-group KV model: auto-enabling NPUW_LLM_PROPAGATE_SLICE_UP");
-        }
-        // Apply a static slice only to whole-prefill models. Chunked prefill uses host-side
-        // selection because a short final chunk is left-aligned.
-        if (!m_use_chunk_prefill) {
-            ov::npuw::SliceOutEmbeds(axes.batch, m_kvcache_desc.max_generation_token_len).run_on_model(prefill_model);
-            if (propagate_slice_up) {
-                ov::npuw::PropagateSliceUp().run_on_model(prefill_model);
-            }
+        LOG_DEBUG("Shared LM head: select prefill output rows");
+        ov::npuw::SelectLastLogits(axes.batch, m_kvcache_desc.max_generation_token_len, LLMCompiledModel::output_embeds)
+            .run_on_model(prefill_model);
+        for (auto& generate_variant : generate_model_variants) {
+            ov::npuw::SelectLastLogits(axes.batch,
+                                       m_kvcache_desc.max_generation_token_len,
+                                       LLMCompiledModel::output_embeds)
+                .run_on_model(generate_variant);
         }
         LOG_DEBUG("Make LM head model with static shapes");
         ov::npuw::ReshapeSlicedHeadToStatic(axes.batch, m_kvcache_desc.max_generation_token_len)
             .run_on_model(lm_head_model);
-    } else if (m_use_chunk_prefill) {
-        LOG_DEBUG("Chunked prefill: dynamically select the last valid logits.");
-        ov::npuw::SelectLastChunkLogits(axes.batch, m_prefill_chunk_size).run_on_model(prefill_model);
+    } else if (!m_is_embedding && !m_is_whisper) {
+        LOG_DEBUG("Select left-aligned logits rows for prefill and generate.");
+        ov::npuw::SelectLastLogits(axes.batch, m_kvcache_desc.max_generation_token_len, "logits")
+            .run_on_model(prefill_model);
+        for (auto& generate_variant : generate_model_variants) {
+            ov::npuw::SelectLastLogits(axes.batch, m_kvcache_desc.max_generation_token_len, "logits")
+                .run_on_model(generate_variant);
+        }
     }
 
     const auto prefill_attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_ATTENTION_HINT>();
@@ -1236,9 +1232,6 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         // reused across their respective instances.
         if (is_per_layer_inputs_model) {
             prefill_config["NPUW_ONLINE_KEEP_BLOCKS"] = "3";
-            if (propagate_slice_up) {
-                prefill_config["NPUW_ONLINE_KEEP_BLOCKS_TAGGED"] = "attn";
-            }
             LOG_INFO("Gemma-4 cross-group KV model: setting NPUW_ONLINE_KEEP_BLOCKS=3 for prefill");
         }
     }

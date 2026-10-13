@@ -113,7 +113,9 @@ protected:
                         ov::SoPtr<ov::ITensor> position_ids,
                         ov::SoPtr<ov::ITensor> per_layer_inputs);
 
-    void copy_last_prefill_embeds_to_lm_head(uint32_t valid_token_count);
+    void set_logits_selection_indices(const std::shared_ptr<ov::IAsyncInferRequest>& request,
+                                      const PortsMap& in_ports,
+                                      uint32_t valid_token_count) const;
 
     // Continuation counterpart of prepare_for_new_conversation(), run by
     // infer_prefill() when a granted keep is armed. Validates the delta inputs,
