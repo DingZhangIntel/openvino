@@ -1055,30 +1055,39 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
 
     const bool is_per_layer_inputs_model = has_per_layer_inputs(prefill_model);
+    const bool supports_logits_selection = !m_is_embedding && !m_is_whisper;
     if (m_cfg.get<::intel_npu::NPUW_LLM_PROPAGATE_SLICE_UP>()) {
         LOG_WARN("NPUW_LLM_PROPAGATE_SLICE_UP is not applied to runtime logits Gather selection.");
     }
+    if (is_per_layer_inputs_model) {
+        // TODO(CVS-190643): Extend PropagateSliceUp to runtime logits Gather before re-enabling this optimization.
+        LOG_INFO("Gemma-4 cross-group KV model: runtime logits Gather is not propagated through the shared tail.");
+    }
 
-    if (lm_head_model) {
+    if (lm_head_model && supports_logits_selection) {
         LOG_DEBUG("Shared LM head: select prefill output rows");
         ov::npuw::SelectLastLogits(axes.batch, m_kvcache_desc.max_generation_token_len, LLMCompiledModel::output_embeds)
             .run_on_model(prefill_model);
-        for (auto& generate_variant : generate_model_variants) {
-            ov::npuw::SelectLastLogits(axes.batch,
-                                       m_kvcache_desc.max_generation_token_len,
-                                       LLMCompiledModel::output_embeds)
-                .run_on_model(generate_variant);
+        if (m_kvcache_desc.max_generation_token_len > 1u) {
+            for (auto& generate_variant : generate_model_variants) {
+                ov::npuw::SelectLastLogits(axes.batch,
+                                           m_kvcache_desc.max_generation_token_len,
+                                           LLMCompiledModel::output_embeds)
+                    .run_on_model(generate_variant);
+            }
         }
         LOG_DEBUG("Make LM head model with static shapes");
         ov::npuw::ReshapeSlicedHeadToStatic(axes.batch, m_kvcache_desc.max_generation_token_len)
             .run_on_model(lm_head_model);
-    } else if (!m_is_embedding && !m_is_whisper) {
+    } else if (supports_logits_selection) {
         LOG_DEBUG("Select left-aligned logits rows for prefill and generate.");
         ov::npuw::SelectLastLogits(axes.batch, m_kvcache_desc.max_generation_token_len, "logits")
             .run_on_model(prefill_model);
-        for (auto& generate_variant : generate_model_variants) {
-            ov::npuw::SelectLastLogits(axes.batch, m_kvcache_desc.max_generation_token_len, "logits")
-                .run_on_model(generate_variant);
+        if (m_kvcache_desc.max_generation_token_len > 1u) {
+            for (auto& generate_variant : generate_model_variants) {
+                ov::npuw::SelectLastLogits(axes.batch, m_kvcache_desc.max_generation_token_len, "logits")
+                    .run_on_model(generate_variant);
+            }
         }
     }
 
