@@ -5,6 +5,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 
 #include "base_sync_infer_request.hpp"
 #include "llm_compiled_model.hpp"
@@ -114,7 +115,7 @@ protected:
                         ov::SoPtr<ov::ITensor> per_layer_inputs);
 
     void set_logits_selection_indices(const std::shared_ptr<ov::IAsyncInferRequest>& request,
-                                      const PortsMap& in_ports,
+                                      const std::optional<ov::Output<const ov::Node>>& selection_port,
                                       uint32_t valid_token_count) const;
 
     // Continuation counterpart of prepare_for_new_conversation(), run by
@@ -170,6 +171,10 @@ protected:
     // Ports for all generate model variants - maps from request pointer to its input/output ports
     std::unordered_map<std::shared_ptr<ov::IAsyncInferRequest>, PortsMap> m_generate_variant_in_ports;
     std::unordered_map<std::shared_ptr<ov::IAsyncInferRequest>, PortsMap> m_generate_variant_out_ports;
+    std::unordered_map<std::shared_ptr<ov::IAsyncInferRequest>, ov::Output<const ov::Node>>
+        m_generate_variant_logits_selection_ports;
+    std::optional<ov::Output<const ov::Node>> m_prefill_logits_selection_port;
+    std::optional<ov::Output<const ov::Node>> m_kvcache_logits_selection_port;
 
     ov::Output<const ov::Node> m_lm_head_embed_port;
     ov::Output<const ov::Node> m_lm_head_logits_port;
