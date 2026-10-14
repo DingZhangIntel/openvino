@@ -22,6 +22,7 @@
 #include "npuw_transformations/lora_stateful_to_stateless.hpp"
 #include "npuw_transformations/optimize_value_tensors.hpp"
 #include "npuw_transformations/patch_sliding_window_mask.hpp"
+#include "npuw_transformations/propagate_slice.hpp"
 #include "npuw_transformations/remove_token_type_ids.hpp"
 #include "npuw_transformations/replace_deepstack_scatter_with_add.hpp"
 #include "npuw_transformations/reshape_sliced_head_to_static.hpp"
@@ -1060,12 +1061,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     const bool is_per_layer_inputs_model = has_per_layer_inputs(prefill_model);
     const bool supports_logits_selection = !m_is_embedding && !m_is_whisper;
-    if (m_cfg.get<::intel_npu::NPUW_LLM_PROPAGATE_SLICE_UP>()) {
-        LOG_WARN("NPUW_LLM_PROPAGATE_SLICE_UP is not applied to runtime logits Gather selection.");
-    }
-    if (is_per_layer_inputs_model) {
-        // TODO(CVS-190643): Extend PropagateSliceUp to runtime logits Gather before re-enabling this optimization.
-        LOG_INFO("Gemma-4 cross-group KV model: runtime logits Gather is not propagated through the shared tail.");
+    bool propagate_logits_gather = m_cfg.get<::intel_npu::NPUW_LLM_PROPAGATE_SLICE_UP>();
+    if (is_per_layer_inputs_model && !m_cfg.has<::intel_npu::NPUW_LLM_PROPAGATE_SLICE_UP>()) {
+        m_cfg.update({{"NPUW_LLM_PROPAGATE_SLICE_UP", "YES"}});
+        propagate_logits_gather = true;
+        LOG_INFO("Gemma-4 cross-group KV model: auto-enabling runtime logits Gather propagation");
     }
 
     if (lm_head_model && supports_logits_selection) {
@@ -1080,6 +1080,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                     .run_on_model(generate_variant);
             }
         }
+        if (propagate_logits_gather) {
+            ov::npuw::PropagateLogitsGatherUp().run_on_model(prefill_model);
+        }
         LOG_DEBUG("Make LM head model with static shapes");
         ov::npuw::ReshapeSlicedHeadToStatic(axes.batch, m_kvcache_desc.max_generation_token_len)
             .run_on_model(lm_head_model);
@@ -1092,6 +1095,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                 ov::npuw::SelectLastLogits(axes.batch, m_kvcache_desc.max_generation_token_len, "logits")
                     .run_on_model(generate_variant);
             }
+        }
+        if (propagate_logits_gather) {
+            ov::npuw::PropagateLogitsGatherUp().run_on_model(prefill_model);
         }
     }
 
@@ -1245,6 +1251,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         // reused across their respective instances.
         if (is_per_layer_inputs_model) {
             prefill_config["NPUW_ONLINE_KEEP_BLOCKS"] = "3";
+            if (propagate_logits_gather) {
+                prefill_config["NPUW_ONLINE_KEEP_BLOCKS_TAGGED"] = "attn";
+            }
             LOG_INFO("Gemma-4 cross-group KV model: setting NPUW_ONLINE_KEEP_BLOCKS=3 for prefill");
         }
     }
