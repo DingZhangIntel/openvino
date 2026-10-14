@@ -4,8 +4,12 @@
 
 #include "select_last_chunk_logits.hpp"
 
+#include <utility>
+
 #include "../llm_compiled_model_utils.hpp"
-#include "openvino/op/ops.hpp"
+#include "openvino/op/constant.hpp"
+#include "openvino/op/gather.hpp"
+#include "openvino/op/parameter.hpp"
 
 namespace {
 

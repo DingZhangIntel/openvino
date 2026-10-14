@@ -252,8 +252,7 @@ TEST_F(LLMCompiledModelGraphOptionsTest, GeneratePyramidBuildsTwoStaticGenerateV
             ASSERT_TRUE(mask.has_value());
             ASSERT_TRUE(mask->get_partial_shape().is_static());
             generate_attention_mask_shapes.push_back(mask->get_shape());
-            EXPECT_TRUE(find_input(call.model, ov::npuw::util::kLogitsSelectionIndicesParamName).has_value());
-            EXPECT_GE(count_ops<ov::op::v8::Gather>(call.model), 1u);
+            EXPECT_FALSE(find_input(call.model, ov::npuw::util::kLogitsSelectionIndicesParamName).has_value());
         }
     }
     EXPECT_EQ(generate_attention_mask_shapes.size(), 2u);

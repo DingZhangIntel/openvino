@@ -406,10 +406,10 @@ protected:
         m_request->infer();
     }
 
-    void run_generate_step(size_t live_tokens) {
-        set_inputs(make_i64({1, 1}, 1),
-                   make_i64({1, live_tokens + 1}, 1),
-                   make_i64({1, 1}, static_cast<int64_t>(live_tokens)));
+    void run_generate_step(size_t live_tokens, size_t input_token_count = 1u) {
+        set_inputs(make_i64({1, input_token_count}, 1),
+                   make_i64({1, live_tokens + input_token_count}, 1),
+                   make_i64_iota({1, input_token_count}, static_cast<int64_t>(live_tokens)));
         m_request->infer();
     }
 
@@ -636,18 +636,48 @@ TEST_F(LLMContinuedPrefillTest, WholePrefillHandoffReadsLeftAlignedKvOutput) {
 }
 
 TEST_F(LLMContinuedPrefillTest, ShortTailChunkRoutesGraphSelectedEmbedToSharedHead) {
-    auto& req = request();
+    init({{"NPUW_LLM_MAX_GENERATION_TOKEN_LEN", "4"}});
 
-    run_full_prefill(65u);
+    run_full_prefill(67u);
 
-    auto prefill_embeds = LLMContinuedPrefillTestAccess::prefill_output(req, ov::npuw::LLMCompiledModel::output_embeds);
-    ASSERT_EQ(prefill_embeds->get_shape(), (ov::Shape{1, 1, 64}));
-    auto selection_indices = LLMContinuedPrefillTestAccess::prefill_logits_selection_indices(req);
-    ASSERT_EQ(selection_indices->get_shape(), (ov::Shape{1}));
-    EXPECT_EQ(selection_indices->data<int64_t>()[0], 0);
+    auto prefill_embeds =
+        LLMContinuedPrefillTestAccess::prefill_output(request(), ov::npuw::LLMCompiledModel::output_embeds);
+    ASSERT_EQ(prefill_embeds->get_shape(), (ov::Shape{1, 8, 64}));
+    auto selection_indices = LLMContinuedPrefillTestAccess::prefill_logits_selection_indices(request());
+    ASSERT_EQ(selection_indices->get_shape(), (ov::Shape{8}));
+    EXPECT_THAT(std::vector<int64_t>(selection_indices->data<int64_t>(),
+                                     selection_indices->data<int64_t>() + selection_indices->get_size()),
+                ::testing::ElementsAre(0, 0, 0, 0, 0, 0, 1, 2));
 
-    auto lm_head_input = LLMContinuedPrefillTestAccess::lm_head_input(req);
+    auto lm_head_input = LLMContinuedPrefillTestAccess::lm_head_input(request());
     EXPECT_EQ(prefill_embeds->data(), lm_head_input->data());
+}
+
+TEST_F(LLMContinuedPrefillTest, FullChunkStagesAllSelectionIndices) {
+    init({{"NPUW_LLM_MAX_GENERATION_TOKEN_LEN", "4"}});
+
+    run_full_prefill(72u);
+
+    auto indices = LLMContinuedPrefillTestAccess::prefill_logits_selection_indices(request());
+    ASSERT_EQ(indices->get_shape(), (ov::Shape{8}));
+    EXPECT_THAT(std::vector<int64_t>(indices->data<int64_t>(), indices->data<int64_t>() + indices->get_size()),
+                ::testing::ElementsAre(0, 1, 2, 3, 4, 5, 6, 7));
+}
+
+TEST_F(LLMContinuedPrefillTest, ContinuedPrefillStagesDeltaSelectionIndices) {
+    init({{"NPUW_LLM_MAX_GENERATION_TOKEN_LEN", "4"}});
+
+    run_full_prefill(64u);
+    run_generate_step(64u);
+    propose(65u);
+    EXPECT_EQ(stored_tokens(), 64);
+
+    run_delta_prefill(64u, 3u);
+
+    auto indices = LLMContinuedPrefillTestAccess::prefill_logits_selection_indices(request());
+    ASSERT_EQ(indices->get_shape(), (ov::Shape{8}));
+    EXPECT_THAT(std::vector<int64_t>(indices->data<int64_t>(), indices->data<int64_t>() + indices->get_size()),
+                ::testing::ElementsAre(0, 0, 0, 0, 0, 0, 1, 2));
 }
 
 TEST_F(LLMContinuedPrefillTest, WholePrefillStagesExactSharedHeadSelectionIndices) {
@@ -682,12 +712,12 @@ TEST_F(LLMContinuedPrefillTest, GenerateStagesNewestTokenAtLastSelectionIndex) {
     init({{"NPUW_LLM_MAX_GENERATION_TOKEN_LEN", "4"}});
 
     run_full_prefill(65u);
-    run_generate_step(65u);
+    run_generate_step(65u, 3u);
 
     auto indices = LLMContinuedPrefillTestAccess::generate_logits_selection_indices(request());
     ASSERT_EQ(indices->get_shape(), (ov::Shape{8}));
     EXPECT_THAT(std::vector<int64_t>(indices->data<int64_t>(), indices->data<int64_t>() + indices->get_size()),
-                ::testing::ElementsAre(0, 0, 0, 0, 0, 0, 0, 0));
+                ::testing::ElementsAre(0, 0, 0, 0, 0, 0, 1, 2));
 }
 
 // A preflight rejection mutates nothing and leaves the command pending, so a
