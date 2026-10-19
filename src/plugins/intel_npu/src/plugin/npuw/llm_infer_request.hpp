@@ -139,6 +139,7 @@ protected:
     // Selects the generate variant for the given prompt length and rebinds the
     // request, its port maps and the variant index together.
     void bind_generate_variant(int64_t prompt_length);
+    void refresh_kvcache_logits_selection_port();
 
     // Multiple generate inference request variants, each with a different KV cache size
     std::vector<std::shared_ptr<ov::IAsyncInferRequest>> m_generate_requests;

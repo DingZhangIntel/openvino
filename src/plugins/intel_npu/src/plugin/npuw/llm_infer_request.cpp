@@ -330,10 +330,7 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     // Set ports to ensure tensors aren't empty during bind_past_kv()
     m_kvcache_in_ports = m_generate_variant_in_ports.at(m_kvcache_request);
     m_kvcache_out_ports = m_generate_variant_out_ports.at(m_kvcache_request);
-    if (const auto selection_port = m_generate_variant_logits_selection_ports.find(m_kvcache_request);
-        selection_port != m_generate_variant_logits_selection_ports.end()) {
-        m_kvcache_logits_selection_port = selection_port->second;
-    }
+    refresh_kvcache_logits_selection_port();
 
     m_prefill_base_request = compiled_model->m_prefill_compiled->create_base_infer_request();
     m_prefill_request = compiled_model->m_prefill_compiled->wrap_async_infer_request(m_prefill_base_request);
@@ -679,11 +676,7 @@ void ov::npuw::LLMInferRequest::bind_generate_variant(int64_t prompt_length) {
     m_kvcache_request = select_generate_request(prompt_length);
     m_kvcache_in_ports = m_generate_variant_in_ports.at(m_kvcache_request);
     m_kvcache_out_ports = m_generate_variant_out_ports.at(m_kvcache_request);
-    m_kvcache_logits_selection_port.reset();
-    if (const auto selection_port = m_generate_variant_logits_selection_ports.find(m_kvcache_request);
-        selection_port != m_generate_variant_logits_selection_ports.end()) {
-        m_kvcache_logits_selection_port = selection_port->second;
-    }
+    refresh_kvcache_logits_selection_port();
     // Record the selected variant index for O(1) capacity queries and mid-decode switching.
     const auto& reqs = m_generate_requests;
     m_kvcache_variant_idx =
@@ -928,13 +921,17 @@ bool ov::npuw::LLMInferRequest::try_switch_to_larger_variant() {
     m_kvcache_request = m_generate_requests[next_idx];
     m_kvcache_in_ports = m_generate_variant_in_ports.at(m_kvcache_request);
     m_kvcache_out_ports = m_generate_variant_out_ports.at(m_kvcache_request);
+    refresh_kvcache_logits_selection_port();
+    m_kvcache_strategy->on_generate_variant_switch(old_req, old_in_ports, m_kvcache_request, m_kvcache_in_ports);
+    return true;
+}
+
+void ov::npuw::LLMInferRequest::refresh_kvcache_logits_selection_port() {
     m_kvcache_logits_selection_port.reset();
     if (const auto selection_port = m_generate_variant_logits_selection_ports.find(m_kvcache_request);
         selection_port != m_generate_variant_logits_selection_ports.end()) {
         m_kvcache_logits_selection_port = selection_port->second;
     }
-    m_kvcache_strategy->on_generate_variant_switch(old_req, old_in_ports, m_kvcache_request, m_kvcache_in_ports);
-    return true;
 }
 
 void ov::npuw::LLMInferRequest::trim_kvcache_for_speculative_decoding(ov::SoPtr<ov::ITensor> position_ids) {
