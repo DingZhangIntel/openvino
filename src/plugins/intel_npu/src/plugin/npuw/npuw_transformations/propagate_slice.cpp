@@ -422,19 +422,17 @@ public:
             }
 
             const auto& input_shape = matmul_node->get_input_partial_shape(0);
-            if (input_shape.is_dynamic() || input_shape.rank().get_length() < 2) {
+            const auto& output_shape = matmul_node->get_output_partial_shape(0);
+            if (input_shape.is_dynamic() || output_shape.is_dynamic() || input_shape.rank().get_length() < 2 ||
+                input_shape.rank().get_length() != output_shape.rank().get_length() || matmul_node->get_transpose_a()) {
                 return false;
             }
             const int64_t rank = input_shape.rank().get_length();
-            if (*axis == rank - 1) {
+            if (*axis != rank - 2) {
                 return false;
             }
-            int64_t input_axis = *axis;
-            if (matmul_node->get_transpose_a() && *axis == rank - 2) {
-                input_axis = rank - 1;
-            }
 
-            auto selected_data = clone_logits_selection_gather(gather_node, matmul_node->input_value(0), input_axis);
+            auto selected_data = clone_logits_selection_gather(gather_node, matmul_node->input_value(0), *axis);
             auto selected_matmul = matmul_node->clone_with_new_inputs({selected_data, matmul_node->input_value(1)});
             selected_matmul->set_friendly_name(matmul_node->get_friendly_name() + "_selected");
             selected_matmul->validate_and_infer_types();
@@ -477,6 +475,7 @@ public:
                 reduction_axes.push_back(
                     static_cast<int64_t>(ov::util::normalize_axis(axis, input_shape.rank().get_length())));
             }
+            std::sort(reduction_axes.begin(), reduction_axes.end());
 
             int64_t input_axis = *output_axis;
             if (input_shape.rank().get_length() != output_shape.rank().get_length()) {
@@ -586,9 +585,10 @@ public:
         register_matcher(std::make_shared<Matcher>(gather, "PropagateLogitsGatherThroughSDPA"), [=](Matcher& m) {
             auto& map = m.get_pattern_value_map();
             const auto gather_node = ov::as_type_ptr<ov::op::v8::Gather>(map[gather].get_node_shared_ptr());
-            const auto sdpa_node = map[sdpa].get_node_shared_ptr();
+            const auto sdpa_node =
+                ov::as_type_ptr<ov::op::v13::ScaledDotProductAttention>(map[sdpa].get_node_shared_ptr());
             const auto output_axis = get_logits_selection_axis(gather_node);
-            if (!output_axis) {
+            if (!output_axis || sdpa_node->get_causal()) {
                 return false;
             }
 

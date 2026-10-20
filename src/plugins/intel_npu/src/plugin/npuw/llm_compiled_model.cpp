@@ -1058,10 +1058,15 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     const bool is_per_layer_inputs_model = has_per_layer_inputs(prefill_model);
     const bool supports_logits_selection = !m_is_embedding && !m_is_whisper;
     bool propagate_logits_gather = m_cfg.get<::intel_npu::NPUW_LLM_PROPAGATE_SLICE_UP>();
-    if (is_per_layer_inputs_model && !m_cfg.has<::intel_npu::NPUW_LLM_PROPAGATE_SLICE_UP>()) {
-        m_cfg.update({{"NPUW_LLM_PROPAGATE_SLICE_UP", "YES"}});
-        propagate_logits_gather = true;
-        LOG_INFO("Gemma-4 cross-group KV model: auto-enabling runtime logits Gather propagation");
+    if (is_per_layer_inputs_model) {
+        if (propagate_logits_gather) {
+            LOG_WARN("NPUW_LLM_PROPAGATE_SLICE_UP is disabled for Gemma-4 until runtime Gather reaches the "
+                     "KV-shared tail.");
+        } else {
+            LOG_INFO("Gemma-4 cross-group KV model: runtime logits Gather propagation is deferred until it reaches "
+                     "the KV-shared tail.");
+        }
+        propagate_logits_gather = false;
     }
 
     if (lm_head_model && supports_logits_selection) {
@@ -1247,9 +1252,6 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         // reused across their respective instances.
         if (is_per_layer_inputs_model) {
             prefill_config["NPUW_ONLINE_KEEP_BLOCKS"] = "3";
-            if (propagate_logits_gather) {
-                prefill_config["NPUW_ONLINE_KEEP_BLOCKS_TAGGED"] = "attn";
-            }
             LOG_INFO("Gemma-4 cross-group KV model: setting NPUW_ONLINE_KEEP_BLOCKS=3 for prefill");
         }
     }

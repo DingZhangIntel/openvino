@@ -663,6 +663,9 @@ void ov::npuw::LLMInferRequest::zero_prefill_staging() {
     }
     uu::fill_tensor<int64_t>(m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask)), 0);
     uu::fill_tensor<int64_t>(m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::position_ids)), 0);
+    if (m_prefill_logits_selection_port) {
+        uu::fill_tensor<int64_t>(m_prefill_request->get_tensor(*m_prefill_logits_selection_port), 0);
+    }
 
     // Gemma4: Clear per_layer_inputs if present
     if (auto per_layer_port = m_prefill_in_ports.find(layer_names::per_layer_inputs);
