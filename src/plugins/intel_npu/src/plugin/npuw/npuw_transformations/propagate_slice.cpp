@@ -588,7 +588,12 @@ public:
             const auto sdpa_node =
                 ov::as_type_ptr<ov::op::v13::ScaledDotProductAttention>(map[sdpa].get_node_shared_ptr());
             const auto output_axis = get_logits_selection_axis(gather_node);
-            if (!output_axis || sdpa_node->get_causal()) {
+            if (!output_axis) {
+                return false;
+            }
+            if (sdpa_node->get_causal()) {
+                LOG_WARN("PropagateLogitsGatherUp: cannot propagate through causal SDPA "
+                         << sdpa_node->get_friendly_name() << ": its built-in mask depends on the query length");
                 return false;
             }
 
