@@ -1174,6 +1174,140 @@ TEST(PropagateLogitsGatherTest, PropagatesThroughTranspose) {
     EXPECT_EQ(model->get_results()[0]->get_input_shape(0), (Shape{1, 4, 2}));
 }
 
+TEST(PropagateLogitsGatherTest, PropagatesThroughGemmaSequenceReshape) {
+    auto input = std::make_shared<v0::Parameter>(element::f32, Shape{1, 8, 2, 3});
+    auto pattern = v0::Constant::create(element::i64, Shape{3}, {0, 0, 6});
+    auto reshape = std::make_shared<v1::Reshape>(input, pattern, true);
+    auto indices = make_logits_selection_indices(2u);
+    auto selector = make_logits_selector(reshape, indices, 1);
+    auto result = std::make_shared<v0::Result>(selector);
+    auto model = std::make_shared<ov::Model>(ResultVector{result}, ParameterVector{input, indices});
+
+    apply_propagate_logits_gather_up(model);
+
+    const auto selected_reshape = model->get_results()[0]->input_value(0).get_node_shared_ptr();
+    ASSERT_TRUE(is_type<v1::Reshape>(selected_reshape));
+    EXPECT_TRUE(ov::as_type_ptr<v1::Reshape>(selected_reshape)->get_special_zero());
+    EXPECT_TRUE(is_type<v8::Gather>(selected_reshape->input_value(0).get_node_shared_ptr()));
+    EXPECT_EQ(model->get_results()[0]->get_input_shape(0), (Shape{1, 2, 6}));
+}
+
+TEST(PropagateLogitsGatherTest, RejectsNonGemmaReshape) {
+    auto input = std::make_shared<v0::Parameter>(element::f32, Shape{1, 8, 6});
+    auto pattern = v0::Constant::create(element::i64, Shape{3}, {1, 8, 6});
+    auto reshape = std::make_shared<v1::Reshape>(input, pattern, false);
+    auto indices = make_logits_selection_indices(2u);
+    auto selector = make_logits_selector(reshape, indices, 1);
+    auto result = std::make_shared<v0::Result>(selector);
+    auto model = std::make_shared<ov::Model>(ResultVector{result}, ParameterVector{input, indices});
+
+    apply_propagate_logits_gather_up(model);
+
+    EXPECT_TRUE(is_type<v8::Gather>(model->get_results()[0]->input_value(0).get_node_shared_ptr()));
+}
+
+TEST(PropagateLogitsGatherTest, PreservesNumericsThroughGemmaSequenceReshape) {
+    auto input = std::make_shared<v0::Parameter>(element::f32, Shape{1, 8, 2, 3});
+    auto pattern = v0::Constant::create(element::i64, Shape{3}, {0, 0, 6});
+    auto reshape = std::make_shared<v1::Reshape>(input, pattern, true);
+    auto weights = std::make_shared<v0::Parameter>(element::f32, Shape{6, 2});
+    auto matmul = std::make_shared<v0::MatMul>(reshape, weights);
+    auto indices = make_logits_selection_indices(2u);
+    auto selector = make_logits_selector(matmul, indices, 1);
+    auto result = std::make_shared<v0::Result>(selector);
+    auto model = std::make_shared<ov::Model>(ResultVector{result}, ParameterVector{input, weights, indices});
+    auto propagated_model = model->clone();
+    apply_propagate_logits_gather_up(propagated_model);
+
+    auto input_tensor = ov::Tensor(element::f32, Shape{1, 8, 2, 3});
+    for (size_t index = 0; index < input_tensor.get_size(); ++index) {
+        input_tensor.data<float>()[index] = static_cast<float>(index + 1u) / 8.0f;
+    }
+    auto weights_tensor = ov::Tensor(element::f32, Shape{6, 2});
+    for (size_t index = 0; index < weights_tensor.get_size(); ++index) {
+        weights_tensor.data<float>()[index] = static_cast<float>(index % 5u) - 2.0f;
+    }
+
+    const std::array<std::array<int64_t, 2>, 3> selector_values{{{{0, 0}}, {{2, 5}}, {{7, 1}}}};
+    for (const auto& values : selector_values) {
+        auto indices_tensor = ov::Tensor(element::i64, Shape{2});
+        std::copy(values.begin(), values.end(), indices_tensor.data<int64_t>());
+        auto reference = ov::Tensor(element::f32, model->output().get_shape());
+        auto actual = ov::Tensor(element::f32, propagated_model->output().get_shape());
+
+        ASSERT_TRUE(model->evaluate(ov::TensorVector{reference},
+                                    ov::TensorVector{input_tensor, weights_tensor, indices_tensor}));
+        ASSERT_TRUE(propagated_model->evaluate(ov::TensorVector{actual},
+                                               ov::TensorVector{input_tensor, weights_tensor, indices_tensor}));
+        ASSERT_EQ(reference.get_shape(), actual.get_shape());
+        for (size_t index = 0; index < reference.get_size(); ++index) {
+            EXPECT_FLOAT_EQ(reference.data<float>()[index], actual.data<float>()[index]);
+        }
+    }
+}
+
+TEST(PropagateLogitsGatherTest, PropagatesThroughGemmaSharedKVTail) {
+    auto hidden = std::make_shared<v0::Parameter>(element::f32, Shape{1, 8, 6});
+    auto q_weights = std::make_shared<v0::Parameter>(element::f32, Shape{6, 8});
+    auto q_proj = std::make_shared<v0::MatMul>(hidden, q_weights);
+    auto q_pattern = v0::Constant::create(element::i64, Shape{4}, {0, 0, 2, 4});
+    auto q_reshape = std::make_shared<v1::Reshape>(q_proj, q_pattern, true);
+    auto transpose_order = v0::Constant::create(element::i64, Shape{4}, {0, 2, 1, 3});
+    auto q = std::make_shared<v1::Transpose>(q_reshape, transpose_order);
+    auto shared_k = std::make_shared<v0::Parameter>(element::f32, Shape{1, 2, 8, 4});
+    auto shared_v = std::make_shared<v0::Parameter>(element::f32, Shape{1, 2, 8, 4});
+    auto sdpa = std::make_shared<v13::ScaledDotProductAttention>(q, shared_k, shared_v, false);
+    auto attention = std::make_shared<v1::Transpose>(sdpa, transpose_order);
+    auto output_pattern = v0::Constant::create(element::i64, Shape{3}, {0, 0, 8});
+    auto output_reshape = std::make_shared<v1::Reshape>(attention, output_pattern, true);
+    auto o_weights = std::make_shared<v0::Parameter>(element::f32, Shape{8, 6});
+    auto o_proj = std::make_shared<v0::MatMul>(output_reshape, o_weights);
+    auto mlp_up_weights = std::make_shared<v0::Parameter>(element::f32, Shape{6, 10});
+    auto mlp_up = std::make_shared<v0::MatMul>(o_proj, mlp_up_weights);
+    auto activation = std::make_shared<v0::Gelu>(mlp_up);
+    auto mlp_down_weights = std::make_shared<v0::Parameter>(element::f32, Shape{10, 6});
+    auto mlp_down = std::make_shared<v0::MatMul>(activation, mlp_down_weights);
+    auto indices = make_logits_selection_indices(2u);
+    auto selector = make_logits_selector(mlp_down, indices, 1);
+    auto result = std::make_shared<v0::Result>(selector);
+    auto model = std::make_shared<ov::Model>(
+        ResultVector{result},
+        ParameterVector{hidden, q_weights, shared_k, shared_v, o_weights, mlp_up_weights, mlp_down_weights, indices});
+
+    apply_propagate_logits_gather_up(model);
+
+    const auto selected_mlp_down = model->get_results()[0]->input_value(0).get_node_shared_ptr();
+    ASSERT_TRUE(is_type<v0::MatMul>(selected_mlp_down));
+    EXPECT_EQ(selected_mlp_down->get_output_shape(0), (Shape{1, 2, 6}));
+    const auto selected_activation = selected_mlp_down->input_value(0).get_node_shared_ptr();
+    ASSERT_TRUE(is_type<v0::Gelu>(selected_activation));
+    const auto selected_mlp_up = selected_activation->input_value(0).get_node_shared_ptr();
+    ASSERT_TRUE(is_type<v0::MatMul>(selected_mlp_up));
+    EXPECT_EQ(selected_mlp_up->get_output_shape(0), (Shape{1, 2, 10}));
+    const auto selected_o_proj = selected_mlp_up->input_value(0).get_node_shared_ptr();
+    ASSERT_TRUE(is_type<v0::MatMul>(selected_o_proj));
+    EXPECT_EQ(selected_o_proj->get_output_shape(0), (Shape{1, 2, 6}));
+
+    const auto selected_output_reshape = selected_o_proj->input_value(0).get_node_shared_ptr();
+    ASSERT_TRUE(is_type<v1::Reshape>(selected_output_reshape));
+    const auto selected_attention = selected_output_reshape->input_value(0).get_node_shared_ptr();
+    ASSERT_TRUE(is_type<v1::Transpose>(selected_attention));
+    const auto selected_sdpa = selected_attention->input_value(0).get_node_shared_ptr();
+    ASSERT_TRUE(is_type<v13::ScaledDotProductAttention>(selected_sdpa));
+    EXPECT_EQ(selected_sdpa->get_output_shape(0), (Shape{1, 2, 2, 4}));
+    EXPECT_TRUE(is_type<v0::Parameter>(selected_sdpa->input_value(1).get_node_shared_ptr()));
+    EXPECT_TRUE(is_type<v0::Parameter>(selected_sdpa->input_value(2).get_node_shared_ptr()));
+
+    const auto selected_q = selected_sdpa->input_value(0).get_node_shared_ptr();
+    ASSERT_TRUE(is_type<v1::Transpose>(selected_q));
+    const auto selected_q_reshape = selected_q->input_value(0).get_node_shared_ptr();
+    ASSERT_TRUE(is_type<v1::Reshape>(selected_q_reshape));
+    const auto selected_q_proj = selected_q_reshape->input_value(0).get_node_shared_ptr();
+    ASSERT_TRUE(is_type<v0::MatMul>(selected_q_proj));
+    EXPECT_EQ(selected_q_proj->get_output_shape(0), (Shape{1, 2, 8}));
+    EXPECT_TRUE(is_type<v8::Gather>(selected_q_proj->input_value(0).get_node_shared_ptr()));
+}
+
 TEST(PropagateLogitsGatherTest, PropagatesThroughFeatureConcat) {
     auto left = std::make_shared<v0::Parameter>(element::f32, Shape{1, 8, 2});
     auto right = std::make_shared<v0::Parameter>(element::f32, Shape{1, 8, 2});
