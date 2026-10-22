@@ -991,11 +991,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     //    the KV cache still keeps the full context (no memory/perf savings).
     //  - ShrinkSlidingWindowKVCache: shrinks the KV cache to the window size and
     //    manages it as a sliding buffer at runtime for better memory/perf.
-    if (!m_is_whisper && !m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
     LOG_DEBUG("Creating prefill model as clone of transformed kvcache one.");
     auto prefill_model = kvcache_model->clone();
     prefill_model->set_friendly_name(kvcache_model->get_friendly_name() + "_prefill");
 
+    if (!m_is_whisper && !m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
         LOG_DEBUG("Try patch sliding window attention mask for the generate model, if it exists.");
         ov::npuw::PatchSlidingWindowMask().run_on_model(kvcache_model);
         if (!m_use_chunk_prefill) {
