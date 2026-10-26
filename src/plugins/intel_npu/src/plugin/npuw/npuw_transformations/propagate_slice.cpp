@@ -552,6 +552,56 @@ public:
     }
 };
 
+class PropagateLogitsGatherThroughGemmaReshape : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("PropagateLogitsGatherThroughGemmaReshape");
+
+    PropagateLogitsGatherThroughGemmaReshape() {
+        auto reshape = wrap_type<ov::op::v1::Reshape>();
+        auto gather = wrap_type<ov::op::v8::Gather>({reshape, any_input(), any_input()});
+
+        register_matcher(
+            std::make_shared<Matcher>(gather, "PropagateLogitsGatherThroughGemmaReshape"),
+            [=](Matcher& m) {
+                auto& map = m.get_pattern_value_map();
+                const auto gather_node = ov::as_type_ptr<ov::op::v8::Gather>(map[gather].get_node_shared_ptr());
+                const auto reshape_node = ov::as_type_ptr<ov::op::v1::Reshape>(map[reshape].get_node_shared_ptr());
+                const auto axis = get_logits_selection_axis(gather_node);
+                if (!axis || *axis != 1 || !reshape_node->get_special_zero()) {
+                    return false;
+                }
+
+                const auto pattern =
+                    ov::as_type_ptr<ov::op::v0::Constant>(reshape_node->input_value(1).get_node_shared_ptr());
+                const auto& input_shape = reshape_node->get_input_partial_shape(0);
+                const auto& output_shape = reshape_node->get_output_partial_shape(0);
+                if (!pattern || input_shape.is_dynamic() || output_shape.is_dynamic() ||
+                    (input_shape.rank().get_length() != 3 && input_shape.rank().get_length() != 4) ||
+                    (output_shape.rank().get_length() != 3 && output_shape.rank().get_length() != 4) ||
+                    input_shape[0] != output_shape[0] || input_shape[1] != output_shape[1]) {
+                    return false;
+                }
+
+                const auto pattern_values = pattern->cast_vector<int64_t>();
+                if (pattern_values.size() != static_cast<size_t>(output_shape.rank().get_length()) ||
+                    pattern_values[0] != 0 || pattern_values[1] != 0 ||
+                    std::any_of(pattern_values.begin() + 2, pattern_values.end(), [](int64_t dimension) {
+                        return dimension <= 0;
+                    })) {
+                    return false;
+                }
+
+                auto selected_input = clone_logits_selection_gather(gather_node, reshape_node->input_value(0), *axis);
+                auto selected_reshape =
+                    reshape_node->clone_with_new_inputs({selected_input, reshape_node->input_value(1)});
+                selected_reshape->set_friendly_name(reshape_node->get_friendly_name() + "_selected");
+                selected_reshape->validate_and_infer_types();
+                ov::replace_node(gather_node, selected_reshape);
+                return true;
+            });
+    }
+};
+
 class PropagateLogitsGatherThroughConcat : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("PropagateLogitsGatherThroughConcat");
@@ -2840,6 +2890,7 @@ bool PropagateLogitsGatherUp::run_on_model(const std::shared_ptr<ov::Model>& mod
         rewrite.add_matcher<PropagateLogitsGatherThroughReduce>();
         rewrite.add_matcher<PropagateLogitsGatherThroughMatMul>();
         rewrite.add_matcher<PropagateLogitsGatherThroughTranspose>();
+        rewrite.add_matcher<PropagateLogitsGatherThroughGemmaReshape>();
         rewrite.add_matcher<PropagateLogitsGatherThroughConcat>();
         rewrite.add_matcher<PropagateLogitsGatherThroughSDPA>();
 
