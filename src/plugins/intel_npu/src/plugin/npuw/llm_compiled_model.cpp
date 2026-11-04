@@ -23,6 +23,7 @@
 #include "npuw_transformations/detect_causal_mask.hpp"
 #include "npuw_transformations/duplicate_shared_kv_concat.hpp"
 #include "npuw_transformations/insert_vocab_sub128.hpp"
+#include "npuw_transformations/left_aligned_attention.hpp"
 #include "npuw_transformations/lora_stateful_to_stateless.hpp"
 #include "npuw_transformations/mask_linear_attention_padding.hpp"
 #include "npuw_transformations/optimize_lincache_layout.hpp"
@@ -730,6 +731,11 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
             .run_on_model(generate_variant);
 
         ov::npuw::RewriteGQAAttentionMask().run_on_model(generate_variant);
+        if (m_use_chunk_prefill && !m_is_embedding && !m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
+            OPENVINO_ASSERT(ov::npuw::LeftAlignedAttention().run_on_model(generate_variant),
+                            "Chunked generate model has no supported static attention pattern for the left-aligned "
+                            "KV-cache contract.");
+        }
 
         if (m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
             // Must run after ReshapeToStatic, before OptimizeValueTensors (V-tensor optimization).
@@ -1005,18 +1011,6 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     ov::npuw::log_detected_masks(kvcache_model);
 
     const bool is_per_layer_inputs_model = has_per_layer_inputs(kvcache_model);
-    // Gemma-4 E2B/E4B cross-group KV sharing models benefit from shrinking the SWA KV cache.
-    // Runtime Gather propagation remains gated below until it reaches the KV-shared tail.
-    if (is_per_layer_inputs_model) {
-        // SWA shrink is incompatible with prefix caching and multi-token generation (e.g.
-        // speculative decoding). When it applies, continuous prefill is resolved off.
-        const bool swa_shrink_compatible = !m_enable_prefix_caching && max_generation_token_len == 1;
-        if (swa_shrink_compatible && !m_cfg.has<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
-            m_cfg.update({{"NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK", "YES"}});
-            LOG_INFO("Gemma-4 cross-group KV model: auto-enabling NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK");
-        }
-    }
-
     // Two mutually-exclusive ways to handle sliding-window attention (SWA) layers:
     //  - PatchSlidingWindowMask (default): only fixes up the attention mask for correctness;
     //    the KV cache still keeps the full context (no memory/perf savings).
@@ -1115,6 +1109,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             .run_on_model(prefill_model);
     }
     ov::npuw::RewriteGQAAttentionMask().run_on_model(prefill_model);
+    if (m_use_chunk_prefill && !m_is_embedding && !m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
+        OPENVINO_ASSERT(ov::npuw::LeftAlignedAttention().run_on_model(prefill_model),
+                        "Chunked prefill model has no supported static attention pattern for the left-aligned "
+                        "KV-cache contract.");
+    }
     LOG_DEBUG("Make kvcache model with static shapes");
 
     if (m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {

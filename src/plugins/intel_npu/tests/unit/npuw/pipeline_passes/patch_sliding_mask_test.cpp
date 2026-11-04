@@ -208,7 +208,7 @@ TEST_F(ChunkedPrefillSlidingMaskTest, WholePrefillAppliesRightPaddingPatch) {
     EXPECT_GT(count_ops<ov::op::v13::BitwiseOr>(prefill.model), 0u);
 }
 
-TEST_F(ChunkedPrefillSlidingMaskTest, ChunkedPrefillSkipsRightPaddingPatch) {
+TEST_F(ChunkedPrefillSlidingMaskTest, ChunkedPrefillAddsPastLenToStaticGraphs) {
     RecordingFactory recorder;
     auto model = ov::test::npuw::build_sliding_window_test_model(512, 0, make_sliding_window_mask_phi3);
 
@@ -217,9 +217,15 @@ TEST_F(ChunkedPrefillSlidingMaskTest, ChunkedPrefillSkipsRightPaddingPatch) {
         {{"NPUW_LLM_SHARED_HEAD", "NO"}, {"NPUW_LLM_PREFILL_HINT", "DYNAMIC"}, {"NPUW_LLM_PREFILL_CHUNK_SIZE", "32"}},
         recorder));
     const auto& prefill = require_sub_model(recorder, "_prefill");
-    EXPECT_EQ(count_ops<ov::op::v13::BitwiseOr>(prefill.model), 0u);
+    const auto prefill_past_len = find_input(prefill.model, "past_len");
+    ASSERT_TRUE(prefill_past_len.has_value());
+    EXPECT_EQ(prefill_past_len->get_element_type(), ov::element::i64);
+    EXPECT_TRUE(prefill_past_len->get_shape().empty());
     const auto& generate = require_sub_model_containing(recorder, "_kv");
-    EXPECT_GT(count_ops<ov::op::v13::BitwiseOr>(generate.model), 0u);
+    const auto generate_past_len = find_input(generate.model, "past_len");
+    ASSERT_TRUE(generate_past_len.has_value());
+    EXPECT_EQ(generate_past_len->get_element_type(), ov::element::i64);
+    EXPECT_TRUE(generate_past_len->get_shape().empty());
 }
 
 // Real Gemma exports build two mask subgraphs and share them across all

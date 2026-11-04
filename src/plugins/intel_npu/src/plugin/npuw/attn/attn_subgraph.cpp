@@ -824,10 +824,7 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                             const auto& present_dst_view =
                                 ov::npuw::util::view(dst, ATTN_KV_DIM, past_len, present_len);
                             const auto& present_src_view =
-                                ov::npuw::util::view(graph_mask,
-                                                     ATTN_KV_DIM,
-                                                     full_mask_shape[ATTN_KV_DIM] - present_len,
-                                                     present_len);
+                                ov::npuw::util::view(graph_mask, ATTN_KV_DIM, past_len, present_len);
                             NPUW_ASSERT(present_dst_view._ptr && "null tensor view for present mask segment — target "
                                                                  "request tensor may be uninitialized or zero-sized");
                             present_src_view->copy_to(present_dst_view._ptr);
@@ -895,9 +892,7 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                             }
 
                             const std::size_t dst_present_offset = dst_shape[ATTN_KV_DIM] - present_len;
-                            copy_mask_segment(dst_present_offset,
-                                              full_mask_shape[ATTN_KV_DIM] - present_len,
-                                              present_len);
+                            copy_mask_segment(dst_present_offset, static_cast<std::size_t>(past_len), present_len);
                             copy_mask_segment(0, 0, dst_present_offset);
                             state.cached_attention_mask = dst;
                             return;
@@ -1232,15 +1227,12 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                     "HFA: All past KV blocks should together contain exactly past_full_tiles tiles");
 
                         if (final_tile_size > 0) {
+                            OPENVINO_ASSERT(attention_mask_tensor, "HFA: final tile requires an attention mask tensor");
                             const int64_t present_seq_length =
                                 static_cast<int64_t>(present_key_tensor->get_shape()[K_SEQ_DIM]);
                             OPENVINO_ASSERT(present_seq_length == present_tile_size,
                                             "HFA: present KV length must equal the compiled query/present tile size");
-                            const int64_t mask_total_length = attention_mask_tensor->get_shape()[MASK_KV_SEQ_DIM];
-                            const bool is_prefill = state.hfa_selector->this_case() ==
-                                                    runtime::host_flash_attention::Selector::Case::PREFILL;
-                            const int64_t final_mask_offset = is_prefill ? total_kv_length - final_tile_size
-                                                                         : mask_total_length - final_tile_size;
+                            const int64_t final_mask_offset = total_kv_length - final_tile_size;
                             process_tile(final_tile_request,
                                          hfa_desc->_compiled_final_tile_model,
                                          present_key_tensor,
