@@ -41,6 +41,7 @@ protected:
     void transpose_matmul_b(Context::Ref ctx,
                             const std::shared_ptr<ov::op::v0::Parameter>& matched_param,
                             const std::shared_ptr<ov::op::v0::Concat>& matched_concat,
+                            const std::shared_ptr<ov::op::v3::ScatterUpdate>& matched_scatter,
                             const std::shared_ptr<ov::op::v1::Transpose>& matched_transpose,
                             const std::shared_ptr<ov::op::v0::MatMul>& matched_matmul) {
         // A V Parameter may feed multiple matched attention branches. Guard its shape mutation
@@ -58,6 +59,10 @@ protected:
             auto order_cst = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{4}, {0, 2, 3, 1});
             matched_transpose->set_argument(1, order_cst);
             matched_concat->set_axis(3u);
+            if (matched_scatter) {
+                auto axis_cst = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {3});
+                matched_scatter->set_argument(3, axis_cst);
+            }
         }
         matched_matmul->set_transpose_b(true);
         ctx.get().bTransposed = true;
@@ -66,14 +71,16 @@ protected:
     void transpose_matmul_b(Context::Ref ctx,
                             const std::shared_ptr<ov::Node>& node_param,
                             const std::shared_ptr<ov::Node>& node_concat,
+                            const std::shared_ptr<ov::Node>& node_scatter,
                             const std::shared_ptr<ov::Node>& node_transpose,
                             const std::shared_ptr<ov::Node>& node_matmul) {
         auto matched_param = std::static_pointer_cast<ov::op::v0::Parameter>(node_param);
         auto matched_concat = std::static_pointer_cast<ov::op::v0::Concat>(node_concat);
+        auto matched_scatter = ov::as_type_ptr<ov::op::v3::ScatterUpdate>(node_scatter);
         auto matched_transpose = std::static_pointer_cast<ov::op::v1::Transpose>(node_transpose);
         auto matched_matmul = std::static_pointer_cast<ov::op::v0::MatMul>(node_matmul);
 
-        transpose_matmul_b(ctx, matched_param, matched_concat, matched_transpose, matched_matmul);
+        transpose_matmul_b(ctx, matched_param, matched_concat, matched_scatter, matched_transpose, matched_matmul);
     }
 };
 
@@ -166,23 +173,29 @@ private:
         auto transpose = opp::wrap_type<ov::op::v1::Transpose>({opp::any_input(), opp::any_input()});
         auto convert = opp::optional<ov::op::v0::Convert>({param->output(0)});
         auto concat = opp::wrap_type<ov::op::v0::Concat>({convert, transpose});
+        auto scatter =
+            opp::optional<ov::op::v3::ScatterUpdate>({concat, opp::any_input(), opp::any_input(), opp::any_input()});
         auto softmax = opp::wrap_type<ov::op::v8::Softmax>({opp::any_input()});
         // Softmax output maybe sliced when SDPA with sink input is decomposed
         auto maybe_slice = opp::optional<ov::op::v8::Slice>(
             {softmax, opp::any_input(), opp::any_input(), opp::any_input(), opp::any_input()});
-        auto matmul = opp::wrap_type<ov::op::v0::MatMul>({maybe_slice, concat});
+        auto matmul = opp::wrap_type<ov::op::v0::MatMul>({maybe_slice, scatter});
 
         auto callback = [OV_CAPTURE_CPY_AND_THIS](ov::pass::pattern::Matcher& m) {
             auto& node_to_output = m.get_pattern_value_map();
 
             auto matched_node_param = node_to_output.at(param).get_node_shared_ptr();
             auto matched_node_concat = node_to_output.at(concat).get_node_shared_ptr();
+            const auto scatter_it = node_to_output.find(scatter);
+            auto matched_node_scatter =
+                scatter_it == node_to_output.end() ? nullptr : scatter_it->second.get_node_shared_ptr();
             auto matched_node_transpose = node_to_output.at(transpose).get_node_shared_ptr();
             auto matched_node_matmul = node_to_output.at(matmul).get_node_shared_ptr();
 
             transpose_matmul_b(ctx,
                                matched_node_param,
                                matched_node_concat,
+                               matched_node_scatter,
                                matched_node_transpose,
                                matched_node_matmul);
             LOG_DEBUG("vtensors transposed: MHA pattern");
@@ -210,10 +223,12 @@ private:
             opp::wrap_type<ov::op::v1::Transpose, ov::op::v1::Reshape>({opp::any_input(), opp::any_input()});
         auto convert = opp::optional<ov::op::v0::Convert>({param->output(0)});
         auto concat = opp::wrap_type<ov::op::v0::Concat>({convert, transpose});
+        auto scatter =
+            opp::optional<ov::op::v3::ScatterUpdate>({concat, opp::any_input(), opp::any_input(), opp::any_input()});
 
         // only difference is that broadcast wrapped into unsquese/reshape, while transposed tensor didn't change
         const auto unsqueeze_axes = opp::wrap_type<ov::op::v0::Constant>();
-        auto unsqueeze = opp::wrap_type<ov::op::v0::Unsqueeze>({concat, unsqueeze_axes});
+        auto unsqueeze = opp::wrap_type<ov::op::v0::Unsqueeze>({scatter, unsqueeze_axes});
         auto broadcast = opp::wrap_type<ov::op::v1::Broadcast, ov::op::v3::Broadcast>({unsqueeze, opp::any_input()});
         auto reshape = opp::wrap_type<ov::op::v1::Reshape>({broadcast, opp::any_input()});
 
@@ -229,6 +244,9 @@ private:
 
             auto matched_node_param = node_to_output.at(param).get_node_shared_ptr();
             auto matched_node_concat = node_to_output.at(concat).get_node_shared_ptr();
+            const auto scatter_it = node_to_output.find(scatter);
+            auto matched_node_scatter =
+                scatter_it == node_to_output.end() ? nullptr : scatter_it->second.get_node_shared_ptr();
             auto matched_node_transpose = node_to_output.at(transpose).get_node_shared_ptr();
             auto matched_node_matmul = node_to_output.at(matmul).get_node_shared_ptr();
             auto matched_node_unsqueeze = node_to_output.at(unsqueeze).get_node_shared_ptr();
@@ -299,7 +317,8 @@ private:
             reshape_axes_node->set_friendly_name(matched_reshape->get_friendly_name() + "/new_reshape_shape");
             matched_reshape->input(1).replace_source_output(reshape_axes_node);
 
-            transpose_matmul_b(ctx, matched_param, matched_concat, matched_transpose, matched_matmul);
+            const auto matched_scatter = ov::as_type_ptr<ov::op::v3::ScatterUpdate>(matched_node_scatter);
+            transpose_matmul_b(ctx, matched_param, matched_concat, matched_scatter, matched_transpose, matched_matmul);
             LOG_DEBUG("vtensors transposed: GQA pattern");
             return true;
         };

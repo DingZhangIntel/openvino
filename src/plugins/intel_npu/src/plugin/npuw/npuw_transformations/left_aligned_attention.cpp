@@ -8,6 +8,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -77,6 +78,68 @@ bool traces_to_past_kv(const ov::Output<ov::Node>& value) {
     }
     const auto parameter = ov::as_type_ptr<opv0::Parameter>(node);
     return parameter && parameter->get_friendly_name().find("past_key_values") != std::string::npos;
+}
+
+bool depends_on_past_kv(const ov::Output<ov::Node>& value) {
+    std::unordered_set<ov::Node*> visited;
+    std::vector<std::shared_ptr<ov::Node>> pending = {value.get_node_shared_ptr()};
+    while (!pending.empty()) {
+        const auto node = pending.back();
+        pending.pop_back();
+        if (!node || !visited.insert(node.get()).second) {
+            continue;
+        }
+        if (const auto parameter = ov::as_type_ptr<opv0::Parameter>(node)) {
+            if (parameter->get_friendly_name().find("past_key_values") != std::string::npos) {
+                return true;
+            }
+            continue;
+        }
+        for (const auto& input : node->input_values()) {
+            pending.push_back(input.get_node_shared_ptr());
+        }
+    }
+    return false;
+}
+
+bool has_past_kv_input(const std::shared_ptr<opv0::Concat>& concat) {
+    return std::any_of(concat->inputs().begin(), concat->inputs().end(), [](const ov::Input<ov::Node>& input) {
+        return traces_to_past_kv(input.get_source_output());
+    });
+}
+
+void assert_supported_mask_dependencies(const ov::Output<ov::Node>& mask,
+                                        const std::shared_ptr<opv0::Parameter>& attention_mask,
+                                        const std::string& sdpa_name) {
+    std::unordered_set<ov::Node*> shape_only_visited;
+    std::unordered_set<ov::Node*> value_visited;
+    std::vector<std::pair<std::shared_ptr<ov::Node>, bool>> pending = {{mask.get_node_shared_ptr(), false}};
+    while (!pending.empty()) {
+        const auto [node, shape_only] = pending.back();
+        pending.pop_back();
+        if (!node ||
+            !(shape_only ? shape_only_visited.insert(node.get()).second : value_visited.insert(node.get()).second)) {
+            continue;
+        }
+        if (const auto parameter = ov::as_type_ptr<opv0::Parameter>(node)) {
+            const auto& parameter_name = parameter->get_friendly_name();
+            const bool is_static_query_shape =
+                shape_only && (parameter_name == "input_ids" || parameter_name == "inputs_embeds");
+            const bool is_static_position_ids =
+                parameter_name == "position_ids" && parameter->get_partial_shape().is_static();
+            OPENVINO_ASSERT(parameter == attention_mask || parameter_name == ov::npuw::util::kPastLenParamName ||
+                                is_static_query_shape || is_static_position_ids,
+                            "LeftAlignedAttention: SDPA mask depends on unsupported model input ",
+                            parameter_name,
+                            ": ",
+                            sdpa_name);
+            continue;
+        }
+        const bool input_is_shape_only = shape_only || ov::is_type<opv3::ShapeOf>(node);
+        for (const auto& input : node->input_values()) {
+            pending.emplace_back(input.get_node_shared_ptr(), input_is_shape_only);
+        }
+    }
 }
 
 size_t find_present_concat_input(const std::shared_ptr<opv0::Concat>& concat) {
@@ -159,6 +222,22 @@ std::shared_ptr<opv0::Parameter> find_or_add_past_len(const std::shared_ptr<ov::
     return past_len;
 }
 
+std::shared_ptr<opv0::Constant> make_lowest_finite_mask_value(const ov::element::Type& mask_type) {
+    if (mask_type == ov::element::f16) {
+        return opv0::Constant::create(mask_type, ov::Shape{}, {std::numeric_limits<ov::float16>::lowest()});
+    }
+    if (mask_type == ov::element::bf16) {
+        return opv0::Constant::create(mask_type, ov::Shape{}, {std::numeric_limits<ov::bfloat16>::lowest()});
+    }
+    if (mask_type == ov::element::f32) {
+        return opv0::Constant::create(mask_type, ov::Shape{}, {std::numeric_limits<float>::lowest()});
+    }
+    if (mask_type == ov::element::f64) {
+        return opv0::Constant::create(mask_type, ov::Shape{}, {std::numeric_limits<double>::lowest()});
+    }
+    OPENVINO_THROW("LeftAlignedAttention: expected a supported real-valued SDPA mask, got ", mask_type);
+}
+
 ov::Output<ov::Node> make_contiguous_mask(const std::shared_ptr<opv0::Parameter>& attention_mask,
                                           const std::shared_ptr<opv0::Parameter>& past_len,
                                           const ov::Shape& mask_shape,
@@ -193,9 +272,12 @@ ov::Output<ov::Node> make_contiguous_mask(const std::shared_ptr<opv0::Parameter>
     }
 
     const auto valid_4d = std::make_shared<opv0::Unsqueeze>(valid, i64_vector({0, 1}));
+    const auto diagonal = std::make_shared<opv1::Equal>(key_positions, query_positions_col);
+    const auto diagonal_4d = std::make_shared<opv0::Unsqueeze>(diagonal, i64_vector({0, 1}));
     const auto attention_mask_bool = std::make_shared<opv0::Convert>(attention_mask, ov::element::boolean);
     const auto attention_mask_4d = std::make_shared<opv0::Unsqueeze>(attention_mask_bool, i64_vector({1, 2}));
-    const auto combined = std::make_shared<opv1::LogicalAnd>(valid_4d, attention_mask_4d);
+    const auto padding_or_diagonal = std::make_shared<opv1::LogicalOr>(attention_mask_4d, diagonal_4d);
+    const auto combined = std::make_shared<opv1::LogicalAnd>(valid_4d, padding_or_diagonal);
     created_nodes.insert(created_nodes.end(),
                          {key_positions,
                           query_offsets,
@@ -203,8 +285,11 @@ ov::Output<ov::Node> make_contiguous_mask(const std::shared_ptr<opv0::Parameter>
                           query_positions_col,
                           valid,
                           valid_4d,
+                          diagonal,
+                          diagonal_4d,
                           attention_mask_bool,
                           attention_mask_4d,
+                          padding_or_diagonal,
                           combined});
 
     if (mask_type == ov::element::boolean) {
@@ -214,7 +299,7 @@ ov::Output<ov::Node> make_contiguous_mask(const std::shared_ptr<opv0::Parameter>
                     "LeftAlignedAttention: expected a boolean or real-valued SDPA mask, got ",
                     mask_type);
     const auto zero = opv0::Constant::create(mask_type, ov::Shape{}, {0.0f});
-    const auto masked = opv0::Constant::create(mask_type, ov::Shape{}, {-std::numeric_limits<float>::max()});
+    const auto masked = make_lowest_finite_mask_value(mask_type);
     const auto additive = std::make_shared<opv1::Select>(combined, zero, masked);
     created_nodes.insert(created_nodes.end(), {zero, masked, additive});
     return additive;
@@ -224,9 +309,6 @@ ov::Output<ov::Node> make_contiguous_mask(const std::shared_ptr<opv0::Parameter>
 
 bool ov::npuw::LeftAlignedAttention::run_on_model(const std::shared_ptr<ov::Model>& model) {
     const auto attention_mask = find_attention_mask(model);
-    if (!attention_mask) {
-        return false;
-    }
 
     bool rewritten = false;
     std::shared_ptr<opv0::Parameter> past_len;
@@ -235,19 +317,33 @@ bool ov::npuw::LeftAlignedAttention::run_on_model(const std::shared_ptr<ov::Mode
         if (!sdpa) {
             continue;
         }
-        const auto mask_kind = sdpa->get_rt_info().find(ov::npuw::NPUW_SDPA_MASK_RT_KEY);
-        if (mask_kind == sdpa->get_rt_info().end()) {
-            continue;
-        }
-        OPENVINO_ASSERT(sdpa->get_input_size() > kSdpaMaskInput,
-                        "LeftAlignedAttention: recognized SDPA has no explicit mask: ",
-                        sdpa->get_friendly_name());
 
         const auto key_path = find_concat_path(sdpa->input_value(kSdpaKeyInput));
         const auto value_path = find_concat_path(sdpa->input_value(kSdpaValueInput));
-        if (!key_path || !value_path) {
+        const bool key_uses_past_kv = key_path && has_past_kv_input(key_path->concat);
+        const bool value_uses_past_kv = value_path && has_past_kv_input(value_path->concat);
+        const bool key_depends_on_past_kv = depends_on_past_kv(sdpa->input_value(kSdpaKeyInput));
+        const bool value_depends_on_past_kv = depends_on_past_kv(sdpa->input_value(kSdpaValueInput));
+        if (!key_depends_on_past_kv && !value_depends_on_past_kv) {
             continue;
         }
+
+        OPENVINO_ASSERT(sdpa->get_input_size() > kSdpaMaskInput,
+                        "LeftAlignedAttention: past-KV SDPA has no explicit mask: ",
+                        sdpa->get_friendly_name());
+        OPENVINO_ASSERT(key_depends_on_past_kv && value_depends_on_past_kv && key_uses_past_kv && value_uses_past_kv,
+                        "LeftAlignedAttention: past-KV SDPA must expose both K and V through supported Concats: ",
+                        sdpa->get_friendly_name());
+        OPENVINO_ASSERT(attention_mask,
+                        "LeftAlignedAttention: past-KV SDPA requires an attention_mask Parameter: ",
+                        sdpa->get_friendly_name());
+        const auto mask_kind = sdpa->get_rt_info().find(ov::npuw::NPUW_SDPA_MASK_RT_KEY);
+        OPENVINO_ASSERT(mask_kind != sdpa->get_rt_info().end(),
+                        "LeftAlignedAttention: past-KV SDPA has an unsupported attention mask: ",
+                        sdpa->get_friendly_name());
+        assert_supported_mask_dependencies(sdpa->input_value(kSdpaMaskInput),
+                                           attention_mask,
+                                           sdpa->get_friendly_name());
 
         const auto& query_shape = sdpa->get_input_partial_shape(0);
         const auto& key_shape = sdpa->get_input_partial_shape(kSdpaKeyInput);
@@ -259,15 +355,17 @@ bool ov::npuw::LeftAlignedAttention::run_on_model(const std::shared_ptr<ov::Mode
                         sdpa->get_friendly_name());
 
         const auto query_length = static_cast<size_t>(query_shape[kSequenceAxis].get_length());
-        const auto present_key_input = find_present_concat_input(key_path->concat);
-        const auto present_value_input = find_present_concat_input(value_path->concat);
         if (!past_len) {
             past_len = find_or_add_past_len(model);
         }
-        sdpa->input(kSdpaKeyInput)
-            .replace_source_output(make_sdpa_kv_input(*key_path, present_key_input, query_length, past_len));
-        sdpa->input(kSdpaValueInput)
-            .replace_source_output(make_sdpa_kv_input(*value_path, present_value_input, query_length, past_len));
+        if (m_rewrite_kv_cache) {
+            const auto present_key_input = find_present_concat_input(key_path->concat);
+            const auto present_value_input = find_present_concat_input(value_path->concat);
+            sdpa->input(kSdpaKeyInput)
+                .replace_source_output(make_sdpa_kv_input(*key_path, present_key_input, query_length, past_len));
+            sdpa->input(kSdpaValueInput)
+                .replace_source_output(make_sdpa_kv_input(*value_path, present_value_input, query_length, past_len));
+        }
 
         ov::NodeVector mask_nodes;
         const auto contiguous_mask = make_contiguous_mask(attention_mask,

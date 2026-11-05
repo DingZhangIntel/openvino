@@ -26,6 +26,7 @@
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/op/scatter_update.hpp"
 #include "openvino/op/softmax.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/openvino.hpp"
@@ -54,6 +55,7 @@ struct AttentionModelConfig {
     size_t query_len = 1;
     size_t past_len = 63;
     size_t num_layers = 1;
+    bool scatter_after_kv_concat = false;
 };
 
 std::shared_ptr<ov::Model> build_isolated_attention_model(const AttentionModelConfig& cfg) {
@@ -84,7 +86,17 @@ std::shared_ptr<ov::Model> build_isolated_attention_model(const AttentionModelCo
         auto value_concat = std::make_shared<op::v0::Concat>(OutputVector{past_value, new_value}, 2);
         value_concat->set_friendly_name("concat_value." + idx);
 
-        auto qk = std::make_shared<op::v0::MatMul>(query, key_concat, false, true);
+        ov::Output<ov::Node> key_cache = key_concat;
+        ov::Output<ov::Node> value_cache = value_concat;
+        if (cfg.scatter_after_kv_concat) {
+            const auto update_indices = op::v0::Constant::create(element::i64, Shape{1}, {0});
+            const auto sequence_axis = op::v0::Constant::create(element::i64, Shape{}, {2});
+            key_cache = std::make_shared<op::v3::ScatterUpdate>(key_concat, update_indices, new_key, sequence_axis);
+            value_cache =
+                std::make_shared<op::v3::ScatterUpdate>(value_concat, update_indices, new_value, sequence_axis);
+        }
+
+        auto qk = std::make_shared<op::v0::MatMul>(query, key_cache, false, true);
         qk->set_friendly_name("matmul1." + idx);
 
         auto add = std::make_shared<op::v1::Add>(qk->output(0), mask->output(0));
@@ -93,7 +105,7 @@ std::shared_ptr<ov::Model> build_isolated_attention_model(const AttentionModelCo
         auto softmax = std::make_shared<op::v8::Softmax>(add->output(0), 3);
         softmax->set_friendly_name("softmax." + idx);
 
-        auto matmul2 = std::make_shared<op::v0::MatMul>(softmax->output(0), value_concat->output(0));
+        auto matmul2 = std::make_shared<op::v0::MatMul>(softmax->output(0), value_cache);
         matmul2->set_friendly_name("matmul2." + idx);
 
         auto make_result = [&](const ov::Output<ov::Node>& out, const std::string& name) {
@@ -659,6 +671,26 @@ TEST(PyramidAttentionTest, FromReusesOriginalModelForLastPyramidModel) {
     ASSERT_TRUE(pyramid.has_value());
     // The last model should be the original model pointer (optimization)
     EXPECT_EQ(pyramid->_models.back().get(), model.get());
+}
+
+TEST(PyramidAttentionTest, FromClonesPairedScatterUpdatesAfterKvConcats) {
+    AttentionModelConfig cfg;
+    cfg.query_len = 1;
+    cfg.past_len = 2047;
+    cfg.scatter_after_kv_concat = true;
+    auto model = build_isolated_attention_model(cfg);
+
+    auto pyramid = ov::npuw::function::PyramidAttention::from(model);
+
+    ASSERT_TRUE(pyramid.has_value());
+    ASSERT_EQ(pyramid->num_models(), 2u);
+    const auto& reduced_model = pyramid->_models.front();
+    const auto reduced_ops = reduced_model->get_ops();
+    const auto scatter_count =
+        std::count_if(reduced_ops.begin(), reduced_ops.end(), [](const std::shared_ptr<ov::Node>& node) {
+            return ov::is_type<ov::op::v3::ScatterUpdate>(node);
+        });
+    EXPECT_EQ(scatter_count, 2u);
 }
 
 // --- Tests for pyramid attention after KV cache compression (i8) ---

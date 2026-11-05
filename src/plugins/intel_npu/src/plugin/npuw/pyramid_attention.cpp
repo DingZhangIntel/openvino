@@ -15,6 +15,7 @@
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
+#include "openvino/op/scatter_update.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/util/op_types.hpp"
@@ -252,6 +253,22 @@ static bool concat_present_before_past(const std::shared_ptr<ov::Node>& concat_n
     // "present before past" means the past input is not the first input (a present input
     // precedes it). For the contiguous 2-input case this is simply past_idx == 1.
     return past_idx.has_value() && *past_idx > 0;
+}
+
+static std::shared_ptr<ov::op::v3::ScatterUpdate> find_direct_scatter_after_concat(
+    const std::shared_ptr<ov::Node>& concat_node) {
+    if (!concat_node) {
+        return nullptr;
+    }
+    for (const auto& target : concat_node->output(0).get_target_inputs()) {
+        if (target.get_index() == 0u) {
+            if (const auto scatter =
+                    ov::as_type_ptr<ov::op::v3::ScatterUpdate>(target.get_node()->shared_from_this())) {
+                return scatter;
+            }
+        }
+    }
+    return nullptr;
 }
 
 // Helper function to process a single pyramid model (clone, reshape, patch, optimize)
@@ -601,6 +618,11 @@ std::optional<PyramidValidationResult> validate_and_setup_pyramid_attention(cons
                                           << ") for pyramid attention");
         return std::nullopt;
     }
+
+    const auto key_scatter = find_direct_scatter_after_concat(pattern_nodes.past_key_concat_node);
+    const auto value_scatter = find_direct_scatter_after_concat(pattern_nodes.past_value_concat_node);
+    OPENVINO_ASSERT(static_cast<bool>(key_scatter) == static_cast<bool>(value_scatter),
+                    "Pyramid attention requires matching direct ScatterUpdate nodes after K and V Concats.");
 
     // Detect block-split KV cache layout.
     // After SplitKVCacheIntoBlocks the single past_key param becomes N block params named

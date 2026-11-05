@@ -8,13 +8,16 @@
 
 namespace ov::npuw {
 
-// Replaces tail-layout static attention with a runtime-past-length layout for
-// chunked prefill and generation. The original KV Concat remains on the cache
-// output route; only its SDPA-facing branch is rewritten.
+// Rewrites static SDPA masks for a runtime past length. KV layout rewriting is
+// optional because attention isolation modes retain the original K/V graph.
 class LeftAlignedAttention : public ov::pass::ModelPass {
 public:
     OPENVINO_MODEL_PASS_RTTI("ov::npuw::LeftAlignedAttention");
+    explicit LeftAlignedAttention(bool rewrite_kv_cache = true) : m_rewrite_kv_cache(rewrite_kv_cache) {}
     bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
+
+private:
+    bool m_rewrite_kv_cache;
 };
 
 }  // namespace ov::npuw

@@ -58,13 +58,16 @@ struct QuantizedSDPAWithGlobalMaskNodes {
     std::shared_ptr<ov::Node> add, softmax;
     std::shared_ptr<ov::Node> past_v, concat2, convert2, multiply2;
     std::shared_ptr<ov::Node> matmul2, reshape1, transpose, reshape2, fake_quantize;
+    std::shared_ptr<ov::Node> scatter1, scatter2;
 };
 
 inline QuantizedSDPAWithGlobalMaskNodes make_sdpa_decomposed1_pattern() {
     QuantizedSDPAWithGlobalMaskNodes n;
     n.past_k = opp::wrap_type<ov::op::v0::Parameter>();
     n.concat1 = opp::wrap_type<ov::op::v0::Concat>({opp::any_input(), n.past_k});
-    n.convert1 = opp::wrap_type<ov::op::v0::Convert>({n.concat1});
+    n.scatter1 =
+        opp::optional<ov::op::v3::ScatterUpdate>({n.concat1, opp::any_input(), opp::any_input(), opp::any_input()});
+    n.convert1 = opp::wrap_type<ov::op::v0::Convert>({n.scatter1});
     n.multiply1 = opp::wrap_type<ov::op::v1::Multiply>({n.convert1, opp::any_input()});
     n.transpose1 = opp::wrap_type<ov::op::v1::Transpose>({n.multiply1, opp::any_input()});
     n.matmul1 = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), n.transpose1});
@@ -72,7 +75,9 @@ inline QuantizedSDPAWithGlobalMaskNodes make_sdpa_decomposed1_pattern() {
     n.softmax = opp::wrap_type<ov::op::v8::Softmax>({n.add});
     n.past_v = opp::wrap_type<ov::op::v0::Parameter>();
     n.concat2 = opp::wrap_type<ov::op::v0::Concat>({opp::any_input(), n.past_v});
-    n.convert2 = opp::wrap_type<ov::op::v0::Convert>({n.concat2});
+    n.scatter2 =
+        opp::optional<ov::op::v3::ScatterUpdate>({n.concat2, opp::any_input(), opp::any_input(), opp::any_input()});
+    n.convert2 = opp::wrap_type<ov::op::v0::Convert>({n.scatter2});
     n.multiply2 = opp::wrap_type<ov::op::v1::Multiply>({n.convert2, opp::any_input()});
     n.matmul2 = opp::wrap_type<ov::op::v0::MatMul>({n.softmax, n.multiply2});
     n.reshape1 = opp::wrap_type<ov::op::v1::Reshape>({n.matmul2, opp::any_input()});
@@ -93,18 +98,22 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
     auto past_k_gather = opp::optional<ov::op::v8::Gather>({past_k_in->output(0), opp::any_input(), opp::any_input()});
     auto past_k_cvt = opp::optional<ov::op::v0::Convert>({past_k_gather->output(0)});
     auto past_k_cat = opp::wrap_type<ov::op::v0::Concat>({past_k_cvt, opp::any_input()});
+    auto past_k_scatter =
+        opp::optional<ov::op::v3::ScatterUpdate>({past_k_cat, opp::any_input(), opp::any_input(), opp::any_input()});
 
     auto past_v_in = opp::wrap_type<ov::op::v0::Parameter>();
     auto past_v_gather = opp::optional<ov::op::v8::Gather>({past_v_in->output(0), opp::any_input(), opp::any_input()});
     auto past_v_cvt = opp::optional<ov::op::v0::Convert>({past_v_gather->output(0)});
     auto past_v_cat = opp::wrap_type<ov::op::v0::Concat>({past_v_cvt, opp::any_input()});
+    auto past_v_scatter =
+        opp::optional<ov::op::v3::ScatterUpdate>({past_v_cat, opp::any_input(), opp::any_input(), opp::any_input()});
 
     // Optional part, probably one of many. Replace by graph traversal!
-    auto opt_unsq_k = opp::optional<ov::op::v0::Unsqueeze>({past_k_cat->output(0), opp::any_input()});
+    auto opt_unsq_k = opp::optional<ov::op::v0::Unsqueeze>({past_k_scatter->output(0), opp::any_input()});
     auto opt_bcast_k = opp::optional<ov::op::v3::Broadcast>({opt_unsq_k->output(0), opp::any_input()});
     auto opt_rshp_k = opp::optional<ov::op::v1::Reshape>({opt_bcast_k->output(0), opp::any_input()});
 
-    auto opt_unsq_v = opp::optional<ov::op::v0::Unsqueeze>({past_v_cat->output(0), opp::any_input()});
+    auto opt_unsq_v = opp::optional<ov::op::v0::Unsqueeze>({past_v_scatter->output(0), opp::any_input()});
     auto opt_bcast_v = opp::optional<ov::op::v3::Broadcast>({opt_unsq_v->output(0), opp::any_input()});
     auto opt_rshp_v = opp::optional<ov::op::v1::Reshape>({opt_bcast_v->output(0), opp::any_input()});
 
@@ -122,10 +131,12 @@ SDPA::SDPA(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const st
                                                                     past_k_gather,
                                                                     past_k_cvt,
                                                                     past_k_cat,
+                                                                    past_k_scatter,
                                                                     past_v_in,
                                                                     past_v_gather,
                                                                     past_v_cvt,
                                                                     past_v_cat,
+                                                                    past_v_scatter,
                                                                     opt_unsq_k,
                                                                     opt_bcast_k,
                                                                     opt_rshp_k,
@@ -199,6 +210,8 @@ SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>
     };
 
     auto concat1 = opp::wrap_type<ov::op::v0::Concat>(kv_concat_pred);
+    auto scatter1 =
+        opp::optional<ov::op::v3::ScatterUpdate>({concat1, opp::any_input(), opp::any_input(), opp::any_input()});
 
     // GQA optional nodes — require single consumer so shared KV (e.g. Gemma4) does not
     // accidentally match: if any expansion node is shared across multiple heads the
@@ -207,14 +220,16 @@ SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>
     auto single_user = [](const ov::Output<ov::Node>& output) {
         return output.get_target_inputs().size() == 1;
     };
-    auto unsqueeze1 = opp::optional<ov::op::v0::Unsqueeze>({concat1, opp::any_input()}, single_user);
+    auto unsqueeze1 = opp::optional<ov::op::v0::Unsqueeze>({scatter1, opp::any_input()}, single_user);
     auto broadcast1 = opp::optional<ov::op::v3::Broadcast>({unsqueeze1, opp::any_input()}, single_user);
     auto reshape1 = opp::optional<ov::op::v1::Reshape>({broadcast1, opp::any_input()}, single_user);
 
     auto concat2 = opp::wrap_type<ov::op::v0::Concat>(kv_concat_pred);
+    auto scatter2 =
+        opp::optional<ov::op::v3::ScatterUpdate>({concat2, opp::any_input(), opp::any_input(), opp::any_input()});
 
     // GQA optional nodes — same single-consumer guard
-    auto unsqueeze2 = opp::optional<ov::op::v0::Unsqueeze>({concat2, opp::any_input()}, single_user);
+    auto unsqueeze2 = opp::optional<ov::op::v0::Unsqueeze>({scatter2, opp::any_input()}, single_user);
     auto broadcast2 = opp::optional<ov::op::v3::Broadcast>({unsqueeze2, opp::any_input()}, single_user);
     auto reshape2 = opp::optional<ov::op::v1::Reshape>({broadcast2, opp::any_input()}, single_user);
 
@@ -265,6 +280,8 @@ SDPADecomposed::SDPADecomposed(const std::shared_ptr<ov::npuw::online::Snapshot>
         // Isolate Concat nodes with all their Convert inputs
         isolate_concat_with_inputs(concat1);
         isolate_concat_with_inputs(concat2);
+        isolate_matched(scatter1);
+        isolate_matched(scatter2);
 
         // Isolate all other matched nodes in the pattern
         isolate_matched(unsqueeze1);
@@ -341,12 +358,14 @@ SDPACompressed::SDPACompressed(const std::shared_ptr<ov::npuw::online::Snapshot>
     auto subtract1 = opp::optional<ov::op::v1::Subtract>({convert1, zp_convert1});
     auto multiply1 = opp::wrap_type<ov::op::v1::Multiply>({subtract1, opp::any_input()});
     auto concat1 = opp::wrap_type<ov::op::v0::Concat>({multiply1, opp::any_input()});
+    auto scatter1 =
+        opp::optional<ov::op::v3::ScatterUpdate>({concat1, opp::any_input(), opp::any_input(), opp::any_input()});
 
     // GQA optional nodes — single consumer guard
     auto single_user = [](const ov::Output<ov::Node>& output) {
         return output.get_target_inputs().size() == 1;
     };
-    auto unsqueeze1 = opp::optional<ov::op::v0::Unsqueeze>({concat1, opp::any_input()}, single_user);
+    auto unsqueeze1 = opp::optional<ov::op::v0::Unsqueeze>({scatter1, opp::any_input()}, single_user);
     auto broadcast1 = opp::optional<ov::op::v3::Broadcast>({unsqueeze1, opp::any_input()}, single_user);
     auto reshape1 = opp::optional<ov::op::v1::Reshape>({broadcast1, opp::any_input()}, single_user);
 
@@ -356,9 +375,11 @@ SDPACompressed::SDPACompressed(const std::shared_ptr<ov::npuw::online::Snapshot>
     auto subtract2 = opp::optional<ov::op::v1::Subtract>({convert2, zp_convert2});
     auto multiply2 = opp::wrap_type<ov::op::v1::Multiply>({subtract2, opp::any_input()});
     auto concat2 = opp::wrap_type<ov::op::v0::Concat>({multiply2, opp::any_input()});
+    auto scatter2 =
+        opp::optional<ov::op::v3::ScatterUpdate>({concat2, opp::any_input(), opp::any_input(), opp::any_input()});
 
     // GQA optional nodes — same single-consumer guard
-    auto unsqueeze2 = opp::optional<ov::op::v0::Unsqueeze>({concat2, opp::any_input()}, single_user);
+    auto unsqueeze2 = opp::optional<ov::op::v0::Unsqueeze>({scatter2, opp::any_input()}, single_user);
     auto broadcast2 = opp::optional<ov::op::v3::Broadcast>({unsqueeze2, opp::any_input()}, single_user);
     auto reshape2 = opp::optional<ov::op::v1::Reshape>({broadcast2, opp::any_input()}, single_user);
 
@@ -391,6 +412,7 @@ SDPACompressed::SDPACompressed(const std::shared_ptr<ov::npuw::online::Snapshot>
         isolate_matched(subtract1);
         isolate_matched(multiply1);
         isolate_matched(concat1);
+        isolate_matched(scatter1);
         isolate_matched(unsqueeze1);
         isolate_matched(broadcast1);
         isolate_matched(reshape1);
@@ -400,6 +422,7 @@ SDPACompressed::SDPACompressed(const std::shared_ptr<ov::npuw::online::Snapshot>
         isolate_matched(subtract2);
         isolate_matched(multiply2);
         isolate_matched(concat2);
+        isolate_matched(scatter2);
         isolate_matched(unsqueeze2);
         isolate_matched(broadcast2);
         isolate_matched(reshape2);
@@ -455,6 +478,7 @@ QuantizedSDPAWithGlobalMask::QuantizedSDPAWithGlobalMask(const std::shared_ptr<o
                                                                   ".value");
 
         isolate_matched(n.concat1);
+        isolate_matched(n.scatter1);
         isolate_matched(n.convert1);
         isolate_matched(n.multiply1);
         isolate_matched(n.transpose1);
@@ -465,6 +489,7 @@ QuantizedSDPAWithGlobalMask::QuantizedSDPAWithGlobalMask(const std::shared_ptr<o
         isolate_matched(n.softmax);
 
         isolate_matched(n.concat2);
+        isolate_matched(n.scatter2);
         isolate_matched(n.convert2);
         isolate_matched(n.multiply2);
 
@@ -757,6 +782,11 @@ SeparateKVCache::SeparateKVCache() {
 
         auto concat1_node =
             std::dynamic_pointer_cast<ov::op::v0::Concat>(node_to_output.at(n.concat1).get_node_shared_ptr());
+        const auto scatter1_it = node_to_output.find(n.scatter1);
+        auto scatter1_node =
+            scatter1_it == node_to_output.end()
+                ? nullptr
+                : std::dynamic_pointer_cast<ov::op::v3::ScatterUpdate>(scatter1_it->second.get_node_shared_ptr());
         auto convert1_node =
             std::dynamic_pointer_cast<ov::op::v0::Convert>(node_to_output.at(n.convert1).get_node_shared_ptr());
         auto multiply1_node =
@@ -768,6 +798,11 @@ SeparateKVCache::SeparateKVCache() {
 
         auto concat2_node =
             std::dynamic_pointer_cast<ov::op::v0::Concat>(node_to_output.at(n.concat2).get_node_shared_ptr());
+        const auto scatter2_it = node_to_output.find(n.scatter2);
+        auto scatter2_node =
+            scatter2_it == node_to_output.end()
+                ? nullptr
+                : std::dynamic_pointer_cast<ov::op::v3::ScatterUpdate>(scatter2_it->second.get_node_shared_ptr());
         auto convert2_node =
             std::dynamic_pointer_cast<ov::op::v0::Convert>(node_to_output.at(n.convert2).get_node_shared_ptr());
         auto multiply2_node =
@@ -781,13 +816,26 @@ SeparateKVCache::SeparateKVCache() {
         auto concat2_inputs = concat2_node->inputs();
         auto multiply2_inputs = multiply2_node->inputs();
 
+        auto clone_scatter = [&](const std::shared_ptr<ov::op::v3::ScatterUpdate>& scatter,
+                                 const ov::Output<ov::Node>& data) -> ov::Output<ov::Node> {
+            if (!scatter) {
+                return data;
+            }
+            return std::make_shared<ov::op::v3::ScatterUpdate>(data,
+                                                               clone_source(scatter->input_value(1)),
+                                                               clone_source(scatter->input_value(2)),
+                                                               clone_source(scatter->input_value(3)))
+                ->output(0);
+        };
+
         // K-cache chain clone: Concat -> Convert -> Multiply -> Transpose
         auto clone_k = [&]() -> ov::Output<ov::Node> {
             auto new_concat = std::make_shared<ov::op::v0::Concat>(
                 ov::OutputVector{concat1_inputs[0].get_source_output(), concat1_inputs[1].get_source_output()},
                 concat1_node->get_axis());
+            auto new_scatter = clone_scatter(scatter1_node, new_concat);
             auto new_convert =
-                std::make_shared<ov::op::v0::Convert>(new_concat, convert1_node->get_convert_element_type());
+                std::make_shared<ov::op::v0::Convert>(new_scatter, convert1_node->get_convert_element_type());
             auto new_multiply =
                 std::make_shared<ov::op::v1::Multiply>(new_convert,
                                                        clone_source(multiply1_inputs[1].get_source_output()));
@@ -802,8 +850,9 @@ SeparateKVCache::SeparateKVCache() {
             auto new_concat = std::make_shared<ov::op::v0::Concat>(
                 ov::OutputVector{concat2_inputs[0].get_source_output(), concat2_inputs[1].get_source_output()},
                 concat2_node->get_axis());
+            auto new_scatter = clone_scatter(scatter2_node, new_concat);
             auto new_convert =
-                std::make_shared<ov::op::v0::Convert>(new_concat, convert2_node->get_convert_element_type());
+                std::make_shared<ov::op::v0::Convert>(new_scatter, convert2_node->get_convert_element_type());
             auto new_multiply =
                 std::make_shared<ov::op::v1::Multiply>(new_convert,
                                                        clone_source(multiply2_inputs[1].get_source_output()));

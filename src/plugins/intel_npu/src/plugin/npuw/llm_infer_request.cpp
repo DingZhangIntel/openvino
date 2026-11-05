@@ -1457,6 +1457,26 @@ void ov::npuw::LLMInferRequest::set_past_len(const std::shared_ptr<ov::IAsyncInf
     const auto tensor = request->get_tensor(port->second);
     OPENVINO_ASSERT(tensor->get_element_type() == ov::element::i64 && tensor->get_shape().empty(),
                     "past_len must be a scalar i64 tensor.");
+
+    const auto input_ids_port = ports.find(m_input_ids_name);
+    const auto attention_mask_port = ports.find(layer_names::attention_mask);
+    OPENVINO_ASSERT(input_ids_port != ports.end() && attention_mask_port != ports.end(),
+                    "Runtime past-length model must expose input IDs and attention mask ports.");
+    const auto input_shape = request->get_tensor(input_ids_port->second)->get_shape();
+    const auto mask_shape = request->get_tensor(attention_mask_port->second)->get_shape();
+    OPENVINO_ASSERT(input_shape.size() > layer_ids::INPUT_IDS_SEQ_LEN_DIM && !mask_shape.empty(),
+                    "Runtime past-length model has unsupported input or attention-mask shape.");
+    const size_t static_query_length = input_shape[layer_ids::INPUT_IDS_SEQ_LEN_DIM];
+    const size_t static_kv_capacity = mask_shape.back();
+    OPENVINO_ASSERT(static_cast<size_t>(past_len) <= static_kv_capacity &&
+                        static_query_length <= static_kv_capacity - static_cast<size_t>(past_len),
+                    "past_len + static query length exceeds the compiled KV capacity: ",
+                    past_len,
+                    " + ",
+                    static_query_length,
+                    " > ",
+                    static_kv_capacity,
+                    ".");
     tensor->data<int64_t>()[0] = static_cast<int64_t>(past_len);
 }
 

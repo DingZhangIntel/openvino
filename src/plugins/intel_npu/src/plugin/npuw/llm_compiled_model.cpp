@@ -731,10 +731,16 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
             .run_on_model(generate_variant);
 
         ov::npuw::RewriteGQAAttentionMask().run_on_model(generate_variant);
-        if (m_use_chunk_prefill && !m_is_embedding && !m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
-            OPENVINO_ASSERT(ov::npuw::LeftAlignedAttention().run_on_model(generate_variant),
-                            "Chunked generate model has no supported static attention pattern for the left-aligned "
-                            "KV-cache contract.");
+        const auto generate_attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_GENERATE_ATTENTION_HINT>();
+        const bool conventional_generate = max_generation_token_len == 1u;
+        const bool rewrite_generate_kv =
+            generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::STATIC ||
+            (generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::PYRAMID && conventional_generate);
+        if (conventional_generate && !m_is_embedding && !m_is_whisper &&
+            !m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
+            OPENVINO_ASSERT(ov::npuw::LeftAlignedAttention(rewrite_generate_kv).run_on_model(generate_variant),
+                            "Generate model has no supported static attention pattern for the runtime past-length "
+                            "mask contract.");
         }
 
         if (m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
@@ -1109,10 +1115,12 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             .run_on_model(prefill_model);
     }
     ov::npuw::RewriteGQAAttentionMask().run_on_model(prefill_model);
+    const auto prefill_mask_attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_ATTENTION_HINT>();
+    const bool rewrite_prefill_kv = prefill_mask_attn_hint == ::intel_npu::npuw::llm::AttentionHint::STATIC;
     if (m_use_chunk_prefill && !m_is_embedding && !m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
-        OPENVINO_ASSERT(ov::npuw::LeftAlignedAttention().run_on_model(prefill_model),
-                        "Chunked prefill model has no supported static attention pattern for the left-aligned "
-                        "KV-cache contract.");
+        OPENVINO_ASSERT(ov::npuw::LeftAlignedAttention(rewrite_prefill_kv).run_on_model(prefill_model),
+                        "Chunked prefill model has no supported static attention pattern for the runtime past-length "
+                        "mask contract.");
     }
     LOG_DEBUG("Make kvcache model with static shapes");
 
