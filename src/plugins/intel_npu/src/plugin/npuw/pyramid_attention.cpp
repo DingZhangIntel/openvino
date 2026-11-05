@@ -15,6 +15,7 @@
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/reshape.hpp"
+#include "openvino/op/scatter_update.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/op/util/op_types.hpp"
@@ -252,6 +253,22 @@ static bool concat_present_before_past(const std::shared_ptr<ov::Node>& concat_n
     // "present before past" means the past input is not the first input (a present input
     // precedes it). For the contiguous 2-input case this is simply past_idx == 1.
     return past_idx.has_value() && *past_idx > 0;
+}
+
+static std::shared_ptr<ov::op::v3::ScatterUpdate> find_direct_scatter_after_concat(
+    const std::shared_ptr<ov::Node>& concat_node) {
+    if (!concat_node) {
+        return nullptr;
+    }
+    for (const auto& target : concat_node->output(0).get_target_inputs()) {
+        if (target.get_index() == 0u) {
+            if (const auto scatter =
+                    ov::as_type_ptr<ov::op::v3::ScatterUpdate>(target.get_node()->shared_from_this())) {
+                return scatter;
+            }
+        }
+    }
+    return nullptr;
 }
 
 // Helper function to process a single pyramid model (clone, reshape, patch, optimize)
@@ -601,6 +618,11 @@ std::optional<PyramidValidationResult> validate_and_setup_pyramid_attention(cons
                                           << ") for pyramid attention");
         return std::nullopt;
     }
+
+    const auto key_scatter = find_direct_scatter_after_concat(pattern_nodes.past_key_concat_node);
+    const auto value_scatter = find_direct_scatter_after_concat(pattern_nodes.past_value_concat_node);
+    OPENVINO_ASSERT(static_cast<bool>(key_scatter) == static_cast<bool>(value_scatter),
+                    "Pyramid attention requires matching direct ScatterUpdate nodes after K and V Concats.");
 
     // Detect block-split KV cache layout.
     // After SplitKVCacheIntoBlocks the single past_key param becomes N block params named
@@ -1255,6 +1277,13 @@ void PositionIDs::prepare(int64_t past_len) {
     NPUW_ASSERT(m_pyramid_attention && "PyramidAttention reference must not be null");
     const auto& context_lengths = m_pyramid_attention->_context_lengths;
 
+    if (m_case == Case::PREFILL) {
+        m_current_length = past_len;
+        m_past_length = ((past_len + m_query_size - 1) / m_query_size) * m_query_size;
+        m_pyramid_id = select_pyramid_id(context_lengths, static_cast<int64_t>(m_query_size) + m_past_length);
+        return;
+    }
+
     // Same logic as regular attention PositionIDs
     // NOTE: assumes i64 position IDs, matching the original (master) implementation.
     // TODO: models with i32 position IDs would need the i32/i64-aware read used by
@@ -1268,11 +1297,6 @@ void PositionIDs::prepare(int64_t past_len) {
             case Case::GENERATE:
                 // decode case, we have pos_id-1 past elements to take from kvcache
                 m_past_length = m_current_length;
-                break;
-            case Case::PREFILL:
-                // chunked prefill case. calculate the past_length in full chunks
-                // FIXME: We know too much about chunking here
-                m_past_length = ((past_len + m_query_size - 1) / m_query_size) * m_query_size;
                 break;
             default:
                 NPUW_ASSERT(false && "Reached the unreachable code");
@@ -1319,6 +1343,16 @@ void GlobalPositionIDs::prepare(int64_t past_len) {
 
     NPUW_ASSERT(m_pyramid_attention && "PyramidAttention reference must not be null");
     const auto& context_lengths = m_pyramid_attention->_context_lengths;
+
+    if (m_case == Case::PREFILL) {
+        // Global-position attention is evaluated with a fixed query tile. The
+        // active tile follows the known history, not the stale padded tail of
+        // position_ids left by an earlier chunk.
+        m_current_length = past_len;
+        m_past_length = past_len;
+        m_pyramid_id = select_pyramid_id(context_lengths, static_cast<int64_t>(m_pyramid_step) + m_past_length);
+        return;
+    }
 
     const auto found_length = current_length_from_position_ids(in_tensor, in_dims);
     if (!found_length) {

@@ -2051,13 +2051,6 @@ void Partitioner::spatial(const std::string& func_name) {
 void Partitioner::attention(const std::string& func_name) {
     ov::npuw::Function& f = P.functions.at(func_name);
 
-    // Support only attention at the time
-    if (f.gettag() != "attn") {
-        LOG_VERB("No dynamic handling be done to  " << func_name << " in model " << model->get_friendly_name()
-                                                    << "...");
-        return;
-    }
-
     // Get attention mode from NPUW_ATTN config (string type)
     const auto attn_mode = cfg.get<::intel_npu::NPUW_ATTN>();
 
@@ -2065,6 +2058,51 @@ void Partitioner::attention(const std::string& func_name) {
     if (attn_mode == "STATIC") {
         LOG_VERB("Attention optimization disabled (STATIC mode) for " << func_name << " in model "
                                                                       << model->get_friendly_name());
+        return;
+    }
+
+    const auto past_kv_sdpa_counts = [&]() {
+        size_t past_kv_sdpa_count = 0u;
+        size_t without_scatter_count = 0u;
+        const auto has_direct_scatter = [](const std::shared_ptr<ov::Node>& concat) {
+            if (!concat) {
+                return false;
+            }
+            const auto target_inputs = concat->output(0).get_target_inputs();
+            return std::any_of(target_inputs.begin(), target_inputs.end(), [](const ov::Input<ov::Node>& input) {
+                const auto node = input.get_node();
+                return input.get_index() == 0u && node != nullptr &&
+                       node->get_type_name() == std::string("ScatterUpdate");
+            });
+        };
+
+        for (const auto& pattern : ov::npuw::util::find_all_sdpa_pattern_nodes(f._model)) {
+            if (!pattern.is_valid() || pattern.past_key_param_nodes.empty() || pattern.past_value_param_nodes.empty()) {
+                continue;
+            }
+            ++past_kv_sdpa_count;
+            if (!has_direct_scatter(pattern.past_key_concat_node) ||
+                !has_direct_scatter(pattern.past_value_concat_node)) {
+                ++without_scatter_count;
+            }
+        }
+        return std::make_pair(past_kv_sdpa_count, without_scatter_count);
+    }();
+    const auto assert_specialized_attention = [&](const char* mode) {
+        OPENVINO_ASSERT(past_kv_sdpa_counts.first == 0u,
+                        "NPUW_ATTN=",
+                        mode,
+                        " failed to isolate ",
+                        past_kv_sdpa_counts.first,
+                        " past-KV SDPA(s), including ",
+                        past_kv_sdpa_counts.second,
+                        " without a direct K/V ScatterUpdate. Refusing STATIC fallback.");
+    };
+
+    if (f.gettag() != "attn") {
+        LOG_VERB("No dynamic handling be done to  " << func_name << " in model " << model->get_friendly_name()
+                                                    << "...");
+        assert_specialized_attention(attn_mode.c_str());
         return;
     }
 
@@ -2080,6 +2118,7 @@ void Partitioner::attention(const std::string& func_name) {
             return;
         }
         LOG_WARN("No dynamic ranges found in the ATTN block");
+        assert_specialized_attention("DYNAMIC");
     }
 
     // Try PYRAMID attention
@@ -2091,6 +2130,7 @@ void Partitioner::attention(const std::string& func_name) {
             return;
         }
         LOG_WARN("No pyramid attention found in the ATTN block");
+        assert_specialized_attention("PYRAMID");
     }
 
     // Try HFA (Host Flash Attention)
@@ -2147,6 +2187,7 @@ void Partitioner::attention(const std::string& func_name) {
             return;
         }
         LOG_WARN("No host flash attention found in the ATTN block");
+        assert_specialized_attention("HFA");
     }
 }
 

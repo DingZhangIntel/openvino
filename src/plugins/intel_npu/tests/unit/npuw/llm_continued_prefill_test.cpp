@@ -564,7 +564,7 @@ TEST_F(LLMContinuedPrefillTest, ShortTailChunkKeepsInputsAndKvSourceLeftAligned)
     ASSERT_EQ(position_ids->get_size(), 32u);
     EXPECT_EQ(position_ids->data<int64_t>()[0], last_token_position);
     for (size_t index = 1; index < position_ids->get_size(); ++index) {
-        EXPECT_EQ(position_ids->data<int64_t>()[index], 32 + index);
+        EXPECT_EQ(position_ids->data<int64_t>()[index], 0);
     }
 
     auto attention_mask = LLMContinuedPrefillTestAccess::prefill_attention_mask(req);

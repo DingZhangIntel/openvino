@@ -46,7 +46,8 @@ struct LLMVariantSwitchTestAccess {
         return compiled->m_kvcache_desc.max_generation_token_len;
     }
 
-    static void set_num_stored_tokens(const std::shared_ptr<ov::npuw::LLMCompiledModel>& compiled, uint32_t num_tokens) {
+    static void set_num_stored_tokens(const std::shared_ptr<ov::npuw::LLMCompiledModel>& compiled,
+                                      uint32_t num_tokens) {
         compiled->m_kvcache_desc.num_stored_tokens = num_tokens;
     }
 
@@ -622,7 +623,7 @@ TEST_F(LLMInferRequestVariantSwitchTest, RejectsImportedKvcacheDimOutOfPrefillTe
     EXPECT_THROW(LLMVariantSwitchTestAccess::validate_imported_kvcache_dim(compiled), ov::Exception);
 }
 
-TEST_F(LLMInferRequestVariantSwitchTest, GenerateBuildsInternalMaskFromStaticCallerMaskAndClearsTrimmedPast) {
+TEST_F(LLMInferRequestVariantSwitchTest, GenerateBuildsContiguousMaskFromStaticCallerMaskAndClearsTrimmedPast) {
     VariantSwitchFactory factory;
     auto compiled = create_compiled_model({}, factory);
     ASSERT_NE(compiled, nullptr);
@@ -651,21 +652,20 @@ TEST_F(LLMInferRequestVariantSwitchTest, GenerateBuildsInternalMaskFromStaticCal
     EXPECT_EQ(internal_mask->data<int64_t>()[0], 1);
     EXPECT_EQ(internal_mask->data<int64_t>()[1], 0);
     EXPECT_EQ(internal_mask->data<int64_t>()[2], 1);
-    for (size_t i = 3u; i < dest_past_capacity; ++i) {
+    EXPECT_EQ(internal_mask->data<int64_t>()[3], 1);
+    for (size_t i = 4u; i < internal_mask->get_size(); ++i) {
         EXPECT_EQ(internal_mask->data<int64_t>()[i], 0);
     }
-    for (size_t i = internal_mask->get_size() - max_generation_len; i < internal_mask->get_size() - 1u; ++i) {
-        EXPECT_EQ(internal_mask->data<int64_t>()[i], 0);
-    }
-    EXPECT_EQ(internal_mask->data<int64_t>()[internal_mask->get_size() - 1u], 1);
 
     LLMVariantSwitchTestAccess::set_num_stored_tokens(req, 1u);
     LLMVariantSwitchTestAccess::set_total_size(req, 2u);
     std::fill_n(static_attention_mask->data<int64_t>() + 2u, static_attention_mask->get_size() - 2u, 0);
+    static_attention_mask->data<int64_t>()[1] = 1;
     LLMVariantSwitchTestAccess::generate(req, input_ids, static_attention_mask, position_ids);
 
     EXPECT_EQ(internal_mask->data<int64_t>()[0], 1);
-    for (size_t i = 1u; i < dest_past_capacity; ++i) {
+    EXPECT_EQ(internal_mask->data<int64_t>()[1], 1);
+    for (size_t i = 2u; i < internal_mask->get_size(); ++i) {
         EXPECT_EQ(internal_mask->data<int64_t>()[i], 0);
     }
 }

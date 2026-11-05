@@ -12,6 +12,7 @@
 #include "kv_cache_sliding_window_manager.hpp"
 #include "llm_block_kvcache_strategy.hpp"
 #include "llm_compiled_model.hpp"
+#include "llm_compiled_model_utils.hpp"
 #include "llm_continuous_kvcache_strategy.hpp"
 #include "logging.hpp"
 #include "openvino/core/parallel.hpp"
@@ -365,6 +366,11 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     if (const auto selection_port = m_prefill_in_ports.find(ov::npuw::util::kLogitsSelectionIndicesParamName);
         selection_port != m_prefill_in_ports.end()) {
         m_prefill_logits_selection_port = selection_port->second;
+    }
+
+    set_past_len(m_prefill_request, m_prefill_in_ports, 0u);
+    for (const auto& request : m_generate_requests) {
+        set_past_len(request, m_generate_variant_in_ports.at(request), 0u);
     }
 
     // NOTE: Granite-4.0-h-micro uses no Positional Encoding, it doesn't need it because
@@ -729,6 +735,7 @@ void ov::npuw::LLMInferRequest::zero_prefill_staging() {
     if (m_prefill_logits_selection_port) {
         uu::fill_tensor<int64_t>(m_prefill_request->get_tensor(*m_prefill_logits_selection_port), 0);
     }
+    set_past_len(m_prefill_request, m_prefill_in_ports, 0u);
 
     // Gemma4: Clear per_layer_inputs if present
     if (auto per_layer_port = m_prefill_in_ports.find(layer_names::per_layer_inputs);
@@ -1207,6 +1214,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                 // NB: Regular LLM uses 2D position_ids [BATCH, SEQ_LEN], Qwen2.5 VL/Omni, Qwen3.5 VL use 3D
                 // position_ids [3, BATCH, SEQ_LEN] Copy postion ids with considering the 3D position_ids The caller
                 // tensor is delta-relative during a continued prefill.
+                ov::npuw::util::fill_tensor<int64_t>(pos_ids_in_tensor, 0);
                 auto last_dim = position_ids->get_shape().size() - 1;
                 const uint32_t pos_src_offset = kvcache_desc.num_stored_tokens - m_continued_prefill_base;
                 auto actual_position_ids_slice =
@@ -1296,6 +1304,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
 
             // Prepare KV blocks or bind memory for this chunk via strategy.
             m_kvcache_strategy->on_prefill_chunk_begin(static_cast<uint32_t>(current_prompts_len));
+            set_past_len(m_prefill_request, m_prefill_in_ports, kvcache_desc.num_stored_tokens);
         });
 
         m_llm_profile["1/prefill:3b.infer"].record([&]() {
@@ -1435,6 +1444,40 @@ void ov::npuw::LLMInferRequest::set_logits_selection_indices(
     for (uint32_t index = 0; index < selected_token_count; ++index) {
         data[index] = std::max<int64_t>(0, static_cast<int64_t>(valid_token_count) - selected_token_count + index);
     }
+}
+
+void ov::npuw::LLMInferRequest::set_past_len(const std::shared_ptr<ov::IAsyncInferRequest>& request,
+                                             const PortsMap& ports,
+                                             uint32_t past_len) const {
+    const auto port = ports.find(ov::npuw::util::kPastLenParamName);
+    if (port == ports.end()) {
+        return;
+    }
+
+    const auto tensor = request->get_tensor(port->second);
+    OPENVINO_ASSERT(tensor->get_element_type() == ov::element::i64 && tensor->get_shape().empty(),
+                    "past_len must be a scalar i64 tensor.");
+
+    const auto input_ids_port = ports.find(m_input_ids_name);
+    const auto attention_mask_port = ports.find(layer_names::attention_mask);
+    OPENVINO_ASSERT(input_ids_port != ports.end() && attention_mask_port != ports.end(),
+                    "Runtime past-length model must expose input IDs and attention mask ports.");
+    const auto input_shape = request->get_tensor(input_ids_port->second)->get_shape();
+    const auto mask_shape = request->get_tensor(attention_mask_port->second)->get_shape();
+    OPENVINO_ASSERT(input_shape.size() > layer_ids::INPUT_IDS_SEQ_LEN_DIM && !mask_shape.empty(),
+                    "Runtime past-length model has unsupported input or attention-mask shape.");
+    const size_t static_query_length = input_shape[layer_ids::INPUT_IDS_SEQ_LEN_DIM];
+    const size_t static_kv_capacity = mask_shape.back();
+    OPENVINO_ASSERT(static_cast<size_t>(past_len) <= static_kv_capacity &&
+                        static_query_length <= static_kv_capacity - static_cast<size_t>(past_len),
+                    "past_len + static query length exceeds the compiled KV capacity: ",
+                    past_len,
+                    " + ",
+                    static_query_length,
+                    " > ",
+                    static_kv_capacity,
+                    ".");
+    tensor->data<int64_t>()[0] = static_cast<int64_t>(past_len);
 }
 
 void ov::npuw::LLMInferRequest::sync_longrope_mode(const std::shared_ptr<ov::IAsyncInferRequest>& request,
@@ -1761,18 +1804,16 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
                             input_tokens_len,
                             " current); truncating it would drop context.");
         }
-        std::copy_n(attention_mask->data<int64_t>(), past_len, kv_attn_mask->data<int64_t>());
-        // Clear stale entries left by a larger past (e.g. after speculative-decoding trim).
-        if (past_len < dest_past_capacity) {
-            std::fill_n(kv_attn_mask->data<int64_t>() + past_len, dest_past_capacity - past_len, 0);
+        OPENVINO_ASSERT(attention_mask->get_size() >= used_mask_len,
+                        "Attention mask does not cover the current tokens: expected at least ",
+                        used_mask_len,
+                        " entries, got ",
+                        attention_mask->get_size(),
+                        ".");
+        std::copy_n(attention_mask->data<int64_t>(), used_mask_len, kv_attn_mask->data<int64_t>());
+        if (used_mask_len < kv_attn_mask->get_size()) {
+            std::fill_n(kv_attn_mask->data<int64_t>() + used_mask_len, kv_attn_mask->get_size() - used_mask_len, 0);
         }
-        if (input_tokens_len < kvcache_desc.max_generation_token_len) {
-            std::fill_n(
-                kv_attn_mask->data<int64_t>() + kv_attn_mask->get_size() - kvcache_desc.max_generation_token_len,
-                kvcache_desc.max_generation_token_len - input_tokens_len,
-                0);
-        }
-        std::fill_n(kv_attn_mask->data<int64_t>() + kv_attn_mask->get_size() - input_tokens_len, input_tokens_len, 1);
 
         if (m_position_ids_present) {
             auto kv_pos_ids = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::position_ids));
@@ -1797,6 +1838,7 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
                                           /*use_circular_layout=*/true);
     });
 
+    set_past_len(m_kvcache_request, m_kvcache_in_ports, kvcache_desc.num_stored_tokens);
     m_llm_profile["N/generate:2.infer"].record([&]() {
         m_kvcache_request->infer();
     });

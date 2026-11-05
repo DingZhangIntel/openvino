@@ -140,6 +140,9 @@ protected:
     void set_logits_selection_indices(const std::shared_ptr<ov::IAsyncInferRequest>& request,
                                       const std::optional<ov::Output<const ov::Node>>& selection_port,
                                       uint32_t valid_token_count) const;
+    void set_past_len(const std::shared_ptr<ov::IAsyncInferRequest>& request,
+                      const PortsMap& ports,
+                      uint32_t past_len) const;
 
     // Picks the LongRoPE mode for this call from position_ids, points the stage's
     // npuw_lr_cos/npuw_lr_sin inputs at that mode's coefficients, and - when the choice

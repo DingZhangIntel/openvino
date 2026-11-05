@@ -241,6 +241,15 @@ void ov::npuw::runtime::attention::PositionIDs::prepare(int64_t past_len) {
     // Same works for b (there's no choice).
     // c may require traversing the tensor backwards as Generate with N>1 is right_padded (?)
 
+    if (m_case == Case::PREFILL) {
+        // Chunked prefill writes the live rows at the start of the static staging
+        // tensor. History is authoritative when the unused tail still carries an
+        // earlier chunk's position IDs.
+        m_current_length = past_len;
+        m_past_length = ((past_len + m_d.query_size - 1) / m_d.query_size) * m_d.query_size;
+        return;
+    }
+
     auto* pos_data_ptr = in_tensor->data<int64_t>();
     for (auto idx = pos_ids_len - 1; idx >= 0; idx--) {
         if (pos_data_ptr[idx] > 0) {
@@ -250,11 +259,6 @@ void ov::npuw::runtime::attention::PositionIDs::prepare(int64_t past_len) {
             case Case::GENERATE:
                 // decode case, we have pos_id-1 past elements to take from kvcache
                 m_past_length = m_current_length;
-                break;
-            case Case::PREFILL:
-                // chunked prefill case. calculate the past_length in full chunks
-                // FIXME: We know too much about chunking here
-                m_past_length = ((past_len + m_d.query_size - 1) / m_d.query_size) * m_d.query_size;
                 break;
             default:
                 NPUW_ASSERT(false && "Reached the unreachable code");
