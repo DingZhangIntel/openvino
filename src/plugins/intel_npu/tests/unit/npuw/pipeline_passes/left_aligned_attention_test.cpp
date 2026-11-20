@@ -20,10 +20,20 @@
 #include "openvino/op/concat.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/convert.hpp"
+#include "openvino/op/gather.hpp"
+#include "openvino/op/greater_eq.hpp"
+#include "openvino/op/less_eq.hpp"
+#include "openvino/op/logical_and.hpp"
 #include "openvino/op/parameter.hpp"
+#include "openvino/op/range.hpp"
+#include "openvino/op/reduce_sum.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/scatter_update.hpp"
+#include "openvino/op/select.hpp"
+#include "openvino/op/shape_of.hpp"
+#include "openvino/op/subtract.hpp"
+#include "openvino/op/unsqueeze.hpp"
 #include "openvino/openvino.hpp"
 
 namespace {
@@ -197,6 +207,80 @@ TEST(LeftAlignedAttentionTest, RejectsPastKvAttentionWithUnsupportedLayoutPath) 
     for (const auto& node : model->get_ops()) {
         if (const auto sdpa = ov::as_type_ptr<ov::op::v13::ScaledDotProductAttention>(node)) {
             sdpa->input(1).replace_source_output(std::make_shared<ov::op::v0::Abs>(sdpa->input_value(1)));
+        }
+    }
+    model->validate_nodes_and_infer_types();
+
+    EXPECT_THROW(ov::npuw::LeftAlignedAttention().run_on_model(model), ov::Exception);
+}
+
+TEST(LeftAlignedAttentionTest, RewritesLfm3MaskUsingStaticPastKvShape) {
+    constexpr size_t query_length = 3u;
+    auto model = make_static_attention_model(query_length, int64_t{2});
+    const auto& parameters = model->get_parameters();
+    const auto past_key = *std::find_if(parameters.begin(), parameters.end(), [](const auto& parameter) {
+        return parameter->get_friendly_name() == "past_key_values.0.key";
+    });
+    const auto attention_mask = *std::find_if(parameters.begin(), parameters.end(), [](const auto& parameter) {
+        return parameter->get_friendly_name() == "attention_mask";
+    });
+    const auto scalar = [](int64_t value) {
+        return ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {value});
+    };
+    const auto axes = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, {0, 1});
+    const auto padding_axes = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, {1, 2});
+    const auto past_shape = std::make_shared<ov::op::v3::ShapeOf>(past_key);
+    const auto past_length = std::make_shared<ov::op::v8::Gather>(past_shape, scalar(2), scalar(0));
+    const auto total_length = std::make_shared<ov::op::v1::Add>(past_length, scalar(query_length));
+    const auto query_range =
+        std::make_shared<ov::op::v4::Range>(past_length, total_length, scalar(1), ov::element::i64);
+    const auto key_range = std::make_shared<ov::op::v4::Range>(scalar(0), total_length, scalar(1), ov::element::i64);
+    const auto query_positions = std::make_shared<ov::op::v0::Unsqueeze>(query_range, scalar(1));
+    const auto key_positions = std::make_shared<ov::op::v0::Unsqueeze>(key_range, scalar(0));
+    const auto causal = std::make_shared<ov::op::v1::LessEqual>(key_positions, query_positions);
+    const auto causal_4d = std::make_shared<ov::op::v0::Unsqueeze>(causal, axes);
+    const auto padding = std::make_shared<ov::op::v0::Unsqueeze>(
+        std::make_shared<ov::op::v0::Convert>(attention_mask, ov::element::boolean),
+        padding_axes);
+    const auto valid = std::make_shared<ov::op::v1::LogicalAnd>(causal_4d, padding);
+    const auto distance = std::make_shared<ov::op::v1::Subtract>(query_positions, key_positions);
+    const auto outside_window = std::make_shared<ov::op::v1::GreaterEqual>(distance, scalar(2));
+    const auto outside_window_4d = std::make_shared<ov::op::v0::Unsqueeze>(outside_window, axes);
+    const auto fill = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {-65504.0f});
+    const auto zero = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {0.0f});
+    const auto window_mask = std::make_shared<ov::op::v1::Select>(outside_window_4d, fill, zero);
+    const auto mask = std::make_shared<ov::op::v1::Select>(valid, window_mask, fill);
+    for (const auto& node : model->get_ops()) {
+        if (const auto sdpa = ov::as_type_ptr<ov::op::v13::ScaledDotProductAttention>(node)) {
+            sdpa->input(3).replace_source_output(mask);
+            sdpa->get_rt_info().erase(ov::npuw::NPUW_SDPA_MASK_RT_KEY);
+        }
+    }
+    model->validate_nodes_and_infer_types();
+    ov::npuw::DetectAttentionMask().run_on_model(model);
+
+    ASSERT_TRUE(ov::npuw::LeftAlignedAttention().run_on_model(model));
+    expect_contiguous_mask(evaluate_mask(model, 2u), query_length, 2u, int64_t{2});
+}
+
+TEST(LeftAlignedAttentionTest, RejectsMasksThatDependOnPastKvValues) {
+    auto model = make_static_attention_model(1u, ov::npuw::NPUW_SDPA_MASK_CAUSAL);
+    const auto& parameters = model->get_parameters();
+    const auto past_key = *std::find_if(parameters.begin(), parameters.end(), [](const auto& parameter) {
+        return parameter->get_friendly_name() == "past_key_values.0.key";
+    });
+    const auto axes = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {0, 1, 2, 3});
+    const auto past_sum = std::make_shared<ov::op::v1::ReduceSum>(past_key, axes, false);
+    const auto past_shape = std::make_shared<ov::op::v3::ShapeOf>(past_key);
+    const auto shape_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {2});
+    const auto gather_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0});
+    const auto past_length = std::make_shared<ov::op::v8::Gather>(past_shape, shape_axis, gather_axis);
+    const auto combined =
+        std::make_shared<ov::op::v1::Add>(past_sum,
+                                          std::make_shared<ov::op::v0::Convert>(past_length, ov::element::f32));
+    for (const auto& node : model->get_ops()) {
+        if (const auto sdpa = ov::as_type_ptr<ov::op::v13::ScaledDotProductAttention>(node)) {
+            sdpa->input(3).replace_source_output(std::make_shared<ov::op::v1::Add>(sdpa->input_value(3), combined));
         }
     }
     model->validate_nodes_and_infer_types();

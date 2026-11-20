@@ -125,10 +125,12 @@ void assert_supported_mask_dependencies(const ov::Output<ov::Node>& mask,
             const auto& parameter_name = parameter->get_friendly_name();
             const bool is_static_query_shape =
                 shape_only && (parameter_name == "input_ids" || parameter_name == "inputs_embeds");
+            const bool is_static_past_kv_shape =
+                shape_only && parameter->get_partial_shape().is_static() && traces_to_past_kv(parameter->output(0));
             const bool is_static_position_ids =
                 parameter_name == "position_ids" && parameter->get_partial_shape().is_static();
             OPENVINO_ASSERT(parameter == attention_mask || parameter_name == ov::npuw::util::kPastLenParamName ||
-                                is_static_query_shape || is_static_position_ids,
+                                is_static_query_shape || is_static_past_kv_shape || is_static_position_ids,
                             "LeftAlignedAttention: SDPA mask depends on unsupported model input ",
                             parameter_name,
                             ": ",
