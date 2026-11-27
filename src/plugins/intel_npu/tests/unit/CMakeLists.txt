@@ -125,6 +125,7 @@ ov_add_test_target(
             ${OpenVINO_SOURCE_DIR}/src/plugins/intel_npu/src/plugin/npuw/npuw_transformations/cut_lm_head.cpp
             ${OpenVINO_SOURCE_DIR}/src/plugins/intel_npu/src/plugin/npuw/npuw_transformations/drop_zp_subtract.cpp
             ${OpenVINO_SOURCE_DIR}/src/plugins/intel_npu/src/plugin/npuw/npuw_transformations/fold_scalar_dq.cpp
+            ${OpenVINO_SOURCE_DIR}/src/plugins/intel_npu/src/plugin/npuw/npuw_transformations/left_aligned_attention.cpp
             ${OpenVINO_SOURCE_DIR}/src/plugins/intel_npu/src/plugin/npuw/npuw_transformations/untangle_dq_scale.cpp
             ${OpenVINO_SOURCE_DIR}/src/plugins/intel_npu/src/plugin/npuw/npuw_transformations/lora_stateful_to_stateless.cpp
             ${OpenVINO_SOURCE_DIR}/src/plugins/intel_npu/src/plugin/npuw/npuw_transformations/mask_linear_attention_padding.cpp
@@ -245,6 +246,7 @@ target_sources(${TARGET_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pipeline_passes/conv_to_matmul_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pipeline_passes/fold_scalar_dq_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pipeline_passes/cut_lm_head_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pipeline_passes/left_aligned_attention_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pipeline_passes/patch_sliding_mask_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pipeline_passes/select_last_chunk_logits_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pipeline_passes/distance_sliding_mask_test.cpp
@@ -255,7 +257,7 @@ target_sources(${TARGET_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pipeline_passes/stateful_to_stateless_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pipeline_passes/optimize_lincache_layout_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pyramid_attention_test.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pyramid_attention_left_alignment_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/npuw/pyramid_attention_present_before_past_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/sdpa_pattern_matcher_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/host_flash_attention_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/moe_k_tag_test.cpp

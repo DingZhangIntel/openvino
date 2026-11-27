@@ -66,6 +66,14 @@ bool has_transposed_value_matmul(const std::shared_ptr<ov::Model>& model, std::s
     return false;
 }
 
+bool has_left_aligned_kv_scatter(const std::shared_ptr<ov::Model>& model) {
+    const auto ops = model->get_ops();
+    return std::any_of(ops.begin(), ops.end(), [](const auto& op) {
+        return op->get_type_name() == std::string("ScatterUpdate") &&
+               op->get_friendly_name().find("/left_aligned_sdpa") != std::string::npos;
+    });
+}
+
 class ArchAwarePlugin final : public NullPlugin {
 public:
     ArchAwarePlugin(std::string arch, int64_t max_tiles, int64_t compiler_version = 0)
@@ -598,7 +606,7 @@ TEST_F(LLMCompiledModelFactoryOptionsTest, TextRerankTagKeptOutOfStageConfigs) {
     expect_missing_prop(generate.props, "NPUW_TEXT_RERANK");
 }
 
-TEST_F(LLMCompiledModelFactoryOptionsTest, PerLayerInputsModelAutoEnablesSwaShrinkAndDefersGatherPropagation) {
+TEST_F(LLMCompiledModelFactoryOptionsTest, PerLayerInputsModelDefersSwaShrinkAndGatherPropagation) {
     RecordingFactory recorder;
     std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
 
@@ -606,7 +614,7 @@ TEST_F(LLMCompiledModelFactoryOptionsTest, PerLayerInputsModelAutoEnablesSwaShri
                         create_compiled_model(ov::test::npuw::build_per_layer_inputs_probe_model(), {}, recorder));
     ASSERT_NE(compiled, nullptr);
 
-    EXPECT_TRUE(compiled->get_property("NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK").as<bool>());
+    EXPECT_FALSE(compiled->get_property("NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK").as<bool>());
     EXPECT_FALSE(compiled->get_property("NPUW_LLM_PROPAGATE_SLICE_UP").as<bool>());
 }
 
@@ -1044,6 +1052,66 @@ TEST_F(LLMCompiledModelFactoryOptionsTest, HfaAttentionHintsEnableAttentionIsola
     }
 }
 
+TEST_F(LLMCompiledModelFactoryOptionsTest, RuntimePastLengthMaskKeepsAttentionIsolationModes) {
+    struct Case {
+        const char* attention_hint;
+        bool generate_scatter;
+    };
+    for (const auto& test_case : {Case{"DYNAMIC", false}, Case{"PYRAMID", true}, Case{"HFA", false}}) {
+        SCOPED_TRACE(test_case.attention_hint);
+        RecordingFactory recorder;
+        std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
+        ASSERT_NO_THROW(compiled =
+                            create_compiled_model(build_llm_model(),
+                                                  {{"NPUW_LLM_SHARED_HEAD", "NO"},
+                                                   {"NPUW_LLM_PREFILL_HINT", "DYNAMIC"},
+                                                   {"NPUW_LLM_PREFILL_CHUNK_SIZE", "64"},
+                                                   {"NPUW_LLM_PREFILL_ATTENTION_HINT", test_case.attention_hint},
+                                                   {"NPUW_LLM_GENERATE_ATTENTION_HINT", test_case.attention_hint}},
+                                                  recorder));
+        ASSERT_NE(compiled, nullptr);
+
+        const auto& prefill = require_call(recorder, "_prefill");
+        const auto& generate = require_call_containing(recorder, "_kv");
+        expect_prop(prefill.props, "NPUW_ATTN", test_case.attention_hint);
+        expect_prop(generate.props, "NPUW_ATTN", test_case.attention_hint);
+        EXPECT_FALSE(has_left_aligned_kv_scatter(prefill.model));
+        EXPECT_EQ(has_left_aligned_kv_scatter(generate.model), test_case.generate_scatter);
+    }
+}
+
+TEST_F(LLMCompiledModelFactoryOptionsTest, StaticGenerateAvoidsScatterAndStillTransposesValues) {
+    RecordingFactory recorder;
+    std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
+
+    ASSERT_NO_THROW(compiled = create_compiled_model(build_llm_model(),
+                                                     {{"NPUW_LLM_SHARED_HEAD", "NO"},
+                                                      {"NPUW_LLM_PREFILL_ATTENTION_HINT", "STATIC"},
+                                                      {"NPUW_LLM_GENERATE_ATTENTION_HINT", "STATIC"}},
+                                                     recorder));
+    ASSERT_NE(compiled, nullptr);
+
+    const auto& generate = require_call_containing(recorder, "_kv");
+    EXPECT_FALSE(has_left_aligned_kv_scatter(generate.model));
+    EXPECT_TRUE(has_transposed_value_matmul(generate.model, "self_attn"));
+}
+
+TEST_F(LLMCompiledModelFactoryOptionsTest, StaticGroupedAttentionGenerateAvoidsScatter) {
+    auto config = ov::test::npuw::make_test_model_config();
+    config.num_kv_heads = 2;
+    RecordingFactory recorder;
+    std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
+
+    ASSERT_NO_THROW(compiled = create_compiled_model(
+                        ov::test::npuw::build_llm_test_model(config),
+                        {{"NPUW_LLM_SHARED_HEAD", "NO"}, {"NPUW_LLM_GENERATE_ATTENTION_HINT", "STATIC"}},
+                        recorder));
+    ASSERT_NE(compiled, nullptr);
+    const auto& generate = require_call_containing(recorder, "_kv");
+    EXPECT_FALSE(has_left_aligned_kv_scatter(generate.model));
+    EXPECT_TRUE(has_transposed_value_matmul(generate.model, "self_attn"));
+}
+
 TEST_F(LLMCompiledModelFactoryOptionsTest, MoeModelKeepsHostRoutedStageIntegration) {
     RecordingFactory recorder;
     std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
@@ -1371,17 +1439,14 @@ TEST_F(LLMCompiledModelFactoryOptionsTest, TextEmbedOptionCompilesEmbeddingDecod
     EXPECT_NE(recorder.find_suffix("_prefill"), nullptr);
 }
 
-TEST_F(LLMCompiledModelFactoryOptionsTest, Gemma4MoEModelWithInputsEmbedsAndTokenTypeIdsCompilesWithChunkPrefill) {
+TEST_F(LLMCompiledModelFactoryOptionsTest, Gemma4MoEModelWithTokenTypeMaskRejectsChunkedPrefill) {
     RecordingFactory recorder;
     auto model = ov::test::npuw::build_gemma4_moe_llm_test_model();
-    std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
 
-    ASSERT_NO_THROW(
-        compiled = create_compiled_model(model,
-                                         {{"NPUW_LLM_PREFILL_HINT", "DYNAMIC"}, {"NPUW_LLM_PREFILL_CHUNK_SIZE", "128"}},
-                                         recorder));
-    ASSERT_NE(compiled, nullptr);
-    EXPECT_NE(recorder.find_suffix("_prefill"), nullptr);
+    EXPECT_THROW(create_compiled_model(model,
+                                       {{"NPUW_LLM_PREFILL_HINT", "DYNAMIC"}, {"NPUW_LLM_PREFILL_CHUNK_SIZE", "128"}},
+                                       recorder),
+                 ov::Exception);
 }
 
 // is_encoder_embedding_model: a bidirectional encoder (BERT) embedding model has SDPA but no

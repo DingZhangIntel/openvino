@@ -29,6 +29,7 @@ constexpr const char* kDeepstackVisualEmbedsParamName = "deepstack_visual_embeds
 constexpr const char* kTokenTypeIdsParamName = "token_type_ids";
 constexpr const char* kSlidingWindowAttentionMaskParamName = "sliding_window_attention_mask";
 constexpr const char* kLogitsSelectionIndicesParamName = "npuw_logits_selection_indices";
+constexpr const char* kPastLenParamName = "past_len";
 
 bool has_input(const std::shared_ptr<ov::Model>& model, const std::string& name);
 

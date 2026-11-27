@@ -24,6 +24,7 @@
 #include "npuw_transformations/detect_causal_mask.hpp"
 #include "npuw_transformations/duplicate_shared_kv_concat.hpp"
 #include "npuw_transformations/insert_vocab_sub128.hpp"
+#include "npuw_transformations/left_aligned_attention.hpp"
 #include "npuw_transformations/lora_stateful_to_stateless.hpp"
 #include "npuw_transformations/mask_linear_attention_padding.hpp"
 #include "npuw_transformations/optimize_lincache_layout.hpp"
@@ -770,6 +771,21 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
         // The pass treats attention_mask as a 2D 0/1 mask, which an additive 4D float mask is not.
         if (!m_attention_mask_is_4d_float) {
             ov::npuw::RewriteGQAAttentionMask().run_on_model(generate_variant);
+            const auto generate_attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_GENERATE_ATTENTION_HINT>();
+            const bool conventional_generate = max_generation_token_len == 1u;
+            const bool rewrite_generate_kv =
+                generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::STATIC ||
+                (generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::PYRAMID && conventional_generate);
+            if (conventional_generate && !m_is_embedding && !m_is_whisper &&
+                !m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
+                const auto placement = generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::STATIC
+                                           ? ov::npuw::LeftAlignedAttention::SingleTokenPlacement::AT_END
+                                           : ov::npuw::LeftAlignedAttention::SingleTokenPlacement::CONTIGUOUS;
+                OPENVINO_ASSERT(
+                    ov::npuw::LeftAlignedAttention(rewrite_generate_kv, placement).run_on_model(generate_variant),
+                    "Generate model has no supported static attention pattern for the runtime past-length "
+                    "mask contract.");
+            }
         }
 
         if (m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
@@ -1079,33 +1095,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     ov::npuw::log_detected_masks(kvcache_model);
 
     const bool is_per_layer_inputs_model = has_per_layer_inputs(kvcache_model);
-    // Gemma-4 E2B/E4B cross-group KV sharing models benefit from shrinking the SWA KV cache.
-    // Runtime Gather propagation remains gated below until it reaches the KV-shared tail.
-    if (is_per_layer_inputs_model) {
-        // SWA shrink is incompatible with prefix caching and multi-token generation (e.g.
-        // speculative decoding) and with the 4D float attention_mask. When it applies, continuous
-        // prefill is resolved off.
-        const bool swa_shrink_compatible =
-            !m_enable_prefix_caching && max_generation_token_len == 1 && !m_attention_mask_is_4d_float;
-        if (swa_shrink_compatible && !m_cfg.has<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
-            m_cfg.update({{"NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK", "YES"}});
-            LOG_INFO("Gemma-4 cross-group KV model: auto-enabling NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK");
-        }
-    }
-
     // Two mutually-exclusive ways to handle sliding-window attention (SWA) layers:
     //  - PatchSlidingWindowMask (default): only fixes up the attention mask for correctness;
     //    the KV cache still keeps the full context (no memory/perf savings).
     //  - ShrinkSlidingWindowKVCache: shrinks the KV cache to the window size and
     //    manages it as a sliding buffer at runtime for better memory/perf.
-    if (!m_is_whisper && !m_attention_mask_is_4d_float &&
-        !m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
-        LOG_DEBUG("Try patch sliding window attention mask (Phi-3, Gemma-2, Gemma-3, Gemma-4), if it exists.");
-        ov::npuw::PatchSlidingWindowMask().run_on_model(kvcache_model);
-    } else if (m_attention_mask_is_4d_float) {
-        LOG_DEBUG("Skipping PatchSlidingWindowMask for 4D float attention_mask mode.");
-    }
-
     if (m_cfg.get<::intel_npu::NPUW_LLM_OPTIMIZE_LINCACHE_LAYOUT>()) {
         // Applied once before the prefill model and the generate variants are cloned, so all of
         // them share the conv state layout that the byte-wise present -> past copy relies on.
@@ -1122,6 +1116,16 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     LOG_DEBUG("Creating prefill model as clone of transformed kvcache one.");
     auto prefill_model = kvcache_model->clone();
     prefill_model->set_friendly_name(kvcache_model->get_friendly_name() + "_prefill");
+
+    if (!m_is_whisper && !m_attention_mask_is_4d_float &&
+        !m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
+        LOG_DEBUG("Try patch sliding window attention mask for the generate model, if it exists.");
+        ov::npuw::PatchSlidingWindowMask().run_on_model(kvcache_model);
+        if (!m_use_chunk_prefill) {
+            LOG_DEBUG("Apply the same sliding window attention mask patch to whole-prefill model.");
+            ov::npuw::PatchSlidingWindowMask().run_on_model(prefill_model);
+        }
+    }
 
     if (m_use_chunk_prefill && !m_is_embedding) {
         LOG_DEBUG("Right-align attention_mask slice for Conv operations in generate model: LFM-2 case.");
@@ -1196,6 +1200,14 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
     if (!m_attention_mask_is_4d_float) {
         ov::npuw::RewriteGQAAttentionMask().run_on_model(prefill_model);
+        const auto prefill_mask_attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_ATTENTION_HINT>();
+        const bool rewrite_prefill_kv = prefill_mask_attn_hint == ::intel_npu::npuw::llm::AttentionHint::STATIC;
+        if (m_use_chunk_prefill && !m_is_embedding && !m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
+            OPENVINO_ASSERT(
+                ov::npuw::LeftAlignedAttention(rewrite_prefill_kv).run_on_model(prefill_model),
+                "Chunked prefill model has no supported static attention pattern for the runtime past-length "
+                "mask contract.");
+        }
     }
     LOG_DEBUG("Make kvcache model with static shapes");
 

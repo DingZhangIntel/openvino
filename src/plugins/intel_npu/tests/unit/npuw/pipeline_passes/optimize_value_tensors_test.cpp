@@ -20,6 +20,7 @@
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
+#include "openvino/op/scatter_update.hpp"
 #include "openvino/op/shape_of.hpp"
 #include "openvino/op/softmax.hpp"
 #include "openvino/op/transpose.hpp"
@@ -222,6 +223,49 @@ TEST_F(OptimizeValueTensorsPassTest, SharedConcatGenerateValueIsTransposedOnce) 
     for (std::size_t index = 0; index < matmuls.size(); ++index) {
         EXPECT_EQ(concats[index]->get_axis(), 3u);
         EXPECT_TRUE(matmuls[index]->get_transpose_b());
+    }
+}
+
+TEST_F(OptimizeValueTensorsPassTest, SharedScatterValuesPreserveLogicalShape) {
+    auto past = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 2, 5, 4});
+    auto value = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 1, 2, 4});
+    auto scores = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 2, 1, 6});
+    auto order = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {0, 2, 1, 3});
+    auto transpose = std::make_shared<ov::op::v1::Transpose>(value, order);
+    auto concat = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{past, transpose}, 2);
+    auto softmax = std::make_shared<ov::op::v8::Softmax>(scores);
+    ov::OutputVector outputs;
+    std::vector<std::shared_ptr<ov::op::v3::ScatterUpdate>> scatters;
+    std::vector<std::shared_ptr<ov::op::v0::MatMul>> matmuls;
+    for (const int64_t index : {1, 2}) {
+        auto indices = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {index});
+        auto axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {2});
+        auto scatter = std::make_shared<ov::op::v3::ScatterUpdate>(concat, indices, transpose, axis);
+        auto matmul = std::make_shared<ov::op::v0::MatMul>(softmax, scatter);
+        outputs.push_back(matmul);
+        outputs.push_back(std::make_shared<ov::op::v3::ShapeOf>(scatter));
+        scatters.push_back(scatter);
+        matmuls.push_back(matmul);
+    }
+    auto model = std::make_shared<ov::Model>(outputs, ov::ParameterVector{past, value, scores});
+
+    ASSERT_TRUE(ov::npuw::util::OptimizeValueTensors(false).run_on_model(model));
+    EXPECT_EQ(concat->get_axis(), 3u);
+    for (size_t index = 0; index < scatters.size(); ++index) {
+        const auto axis = ov::as_type_ptr<ov::op::v0::Constant>(scatters[index]->input_value(3).get_node_shared_ptr());
+        ASSERT_NE(axis, nullptr);
+        EXPECT_EQ(axis->cast_vector<int64_t>().at(0), 3);
+        EXPECT_TRUE(matmuls[index]->get_transpose_b());
+        const auto restored_shape = model->get_results().at(index * 2 + 1)->input_value(0);
+        ASSERT_TRUE(ov::is_type<ov::op::v8::Gather>(restored_shape.get_node()));
+        auto shape_model =
+            std::make_shared<ov::Model>(ov::OutputVector{restored_shape}, ov::ParameterVector{past, value});
+        ov::TensorVector shape_values{ov::Tensor(ov::element::i64, ov::Shape{4})};
+        ASSERT_TRUE(shape_model->evaluate(shape_values,
+                                          ov::TensorVector{ov::Tensor(ov::element::f32, past->get_shape()),
+                                                           ov::Tensor(ov::element::f32, value->get_shape())}));
+        EXPECT_EQ(std::vector<int64_t>(shape_values[0].data<int64_t>(), shape_values[0].data<int64_t>() + 4),
+                  (std::vector<int64_t>{1, 2, 6, 4}));
     }
 }
 
