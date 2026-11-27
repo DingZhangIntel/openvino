@@ -12,12 +12,18 @@ namespace ov::npuw {
 // optional because attention isolation modes retain the original K/V graph.
 class LeftAlignedAttention : public ov::pass::ModelPass {
 public:
+    enum class SingleTokenPlacement { CONTIGUOUS, AT_END };
+
     OPENVINO_MODEL_PASS_RTTI("ov::npuw::LeftAlignedAttention");
-    explicit LeftAlignedAttention(bool rewrite_kv_cache = true) : m_rewrite_kv_cache(rewrite_kv_cache) {}
+    explicit LeftAlignedAttention(bool rewrite_kv_cache = true,
+                                  SingleTokenPlacement placement = SingleTokenPlacement::CONTIGUOUS)
+        : m_rewrite_kv_cache(rewrite_kv_cache),
+          m_single_token_placement(placement) {}
     bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
 
 private:
     bool m_rewrite_kv_cache;
+    SingleTokenPlacement m_single_token_placement;
 };
 
 }  // namespace ov::npuw

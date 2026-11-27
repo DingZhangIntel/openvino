@@ -24,9 +24,11 @@
 #include "openvino/op/greater_eq.hpp"
 #include "openvino/op/less_eq.hpp"
 #include "openvino/op/logical_and.hpp"
+#include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/range.hpp"
 #include "openvino/op/reduce_sum.hpp"
+#include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/scatter_update.hpp"
@@ -35,6 +37,9 @@
 #include "openvino/op/subtract.hpp"
 #include "openvino/op/unsqueeze.hpp"
 #include "openvino/openvino.hpp"
+#include "openvino/pass/manager.hpp"
+#include "transformations/op_conversions/convert_convertlike.hpp"
+#include "transformations/op_conversions/scaled_dot_product_attention_decomposition.hpp"
 
 namespace {
 
@@ -51,17 +56,18 @@ std::shared_ptr<ov::op::v0::Parameter> make_parameter(const std::string& name,
 
 std::shared_ptr<ov::Model> make_static_attention_model(size_t query_length,
                                                        int64_t mask_kind,
-                                                       ov::element::Type mask_type = ov::element::f32) {
+                                                       ov::element::Type mask_type = ov::element::f32,
+                                                       bool grouped = false) {
     const auto past_capacity = kContextCapacity - query_length;
-    auto query = make_parameter("query", mask_type, {1, 1, query_length, 1});
+    auto query = make_parameter("query", mask_type, {1, grouped ? 2u : 1u, query_length, 1});
     auto past_key = make_parameter("past_key_values.0.key", mask_type, {1, 1, past_capacity, 1});
     auto present_key = make_parameter("present_key", mask_type, {1, 1, query_length, 1});
     auto past_value = make_parameter("past_key_values.0.value", mask_type, {1, 1, past_capacity, 1});
     auto present_value = make_parameter("present_value", mask_type, {1, 1, query_length, 1});
     auto attention_mask = make_parameter("attention_mask", ov::element::i64, {1, kContextCapacity});
 
-    auto key = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{past_key, present_key}, 2);
-    auto value = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{past_value, present_value}, 2);
+    auto key = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{past_key, present_key}, grouped ? -2 : 2);
+    auto value = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{past_value, present_value}, grouped ? -2 : 2);
     auto mask_shape = ov::op::v0::Constant::create(
         ov::element::i64,
         ov::Shape{4},
@@ -69,7 +75,30 @@ std::shared_ptr<ov::Model> make_static_attention_model(size_t query_length,
     auto original_mask =
         std::make_shared<ov::op::v3::Broadcast>(std::make_shared<ov::op::v0::Convert>(attention_mask, mask_type),
                                                 mask_shape);
-    auto sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(query, key, value, original_mask, false);
+    ov::Output<ov::Node> key_input = key;
+    ov::Output<ov::Node> value_input = value;
+    if (grouped) {
+        const auto axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {2});
+        const auto broadcast_shape =
+            ov::op::v0::Constant::create(ov::element::i64,
+                                         ov::Shape{5},
+                                         std::vector<int64_t>{1, 1, 2, static_cast<int64_t>(kContextCapacity), 1});
+        const auto reshape_shape =
+            ov::op::v0::Constant::create(ov::element::i64,
+                                         ov::Shape{4},
+                                         std::vector<int64_t>{1, 2, static_cast<int64_t>(kContextCapacity), 1});
+        const auto repeat_heads = [&](const ov::Output<ov::Node>& input) {
+            const auto unsqueeze = std::make_shared<ov::op::v0::Unsqueeze>(input, axis);
+            const auto broadcast = std::make_shared<ov::op::v3::Broadcast>(unsqueeze,
+                                                                           broadcast_shape,
+                                                                           ov::op::BroadcastType::BIDIRECTIONAL);
+            return std::make_shared<ov::op::v1::Reshape>(broadcast, reshape_shape, false);
+        };
+        key_input = repeat_heads(key);
+        value_input = repeat_heads(value);
+    }
+    auto sdpa =
+        std::make_shared<ov::op::v13::ScaledDotProductAttention>(query, key_input, value_input, original_mask, false);
     sdpa->get_rt_info()[ov::npuw::NPUW_SDPA_MASK_RT_KEY] = mask_kind;
 
     return std::make_shared<ov::Model>(
@@ -190,6 +219,127 @@ TEST(LeftAlignedAttentionTest, RewritesMasksWithoutScatteringKvForIsolation) {
     EXPECT_FALSE(std::any_of(ops.begin(), ops.end(), [](const auto& node) {
         return ov::is_type<ov::op::v3::ScatterUpdate>(node);
     }));
+}
+
+TEST(LeftAlignedAttentionTest, SingleTokenAtEndMatchesScatteredAttention) {
+    for (const bool grouped : {false, true}) {
+        for (const auto mask_kind : {ov::npuw::NPUW_SDPA_MASK_CAUSAL, int64_t{2}}) {
+            SCOPED_TRACE(testing::Message() << "grouped=" << grouped << ", mask_kind=" << mask_kind);
+            auto scattered = make_static_attention_model(1u, mask_kind, ov::element::f32, grouped);
+            auto at_end = scattered->clone();
+            ASSERT_TRUE(ov::npuw::LeftAlignedAttention().run_on_model(scattered));
+            ASSERT_TRUE(
+                ov::npuw::LeftAlignedAttention(true, ov::npuw::LeftAlignedAttention::SingleTokenPlacement::AT_END)
+                    .run_on_model(at_end));
+            const auto at_end_ops = at_end->get_ops();
+            EXPECT_FALSE(std::any_of(at_end_ops.begin(), at_end_ops.end(), [](const auto& node) {
+                return ov::is_type<ov::op::v3::ScatterUpdate>(node);
+            }));
+            for (const auto& model : {scattered, at_end}) {
+                ov::pass::Manager manager;
+                manager.register_pass<ov::pass::ScaledDotProductAttentionDecomposition>();
+                manager.register_pass<ov::pass::ConvertConvertLike>();
+                manager.run_passes(model);
+            }
+            for (const int64_t past_length : {int64_t{0}, int64_t{1}, int64_t{2}, int64_t{6}, int64_t{7}}) {
+                std::vector<ov::TensorVector> results;
+                for (const auto& model : {scattered, at_end}) {
+                    ov::TensorVector inputs;
+                    for (const auto& parameter : model->get_parameters()) {
+                        const auto& name = parameter->get_friendly_name();
+                        ov::Tensor tensor(parameter->get_element_type(), parameter->get_shape());
+                        if (name == "past_len") {
+                            tensor.data<int64_t>()[0] = past_length;
+                        } else if (name == "attention_mask") {
+                            for (size_t index = 0; index < tensor.get_size(); ++index) {
+                                tensor.data<int64_t>()[index] = index % 3u != 0u ? 1 : 0;
+                            }
+                        } else {
+                            for (size_t index = 0; index < tensor.get_size(); ++index) {
+                                tensor.data<float>()[index] = static_cast<float>(index + 1u) / 4.f;
+                            }
+                        }
+                        inputs.push_back(tensor);
+                    }
+                    ov::TensorVector outputs;
+                    for (const auto& output : model->outputs()) {
+                        outputs.emplace_back(output.get_element_type(), output.get_shape());
+                    }
+                    ASSERT_TRUE(model->evaluate(outputs, inputs));
+                    results.push_back(std::move(outputs));
+                }
+                const auto& expected = results[0][0];
+                const auto& actual = results[1][0];
+                ASSERT_EQ(actual.get_size(), expected.get_size());
+                for (size_t index = 0; index < actual.get_size(); ++index) {
+                    EXPECT_NEAR(actual.data<const float>()[index], expected.data<const float>()[index], 1e-5f)
+                        << "past_length=" << past_length << ", index=" << index;
+                }
+            }
+        }
+    }
+}
+
+TEST(LeftAlignedAttentionTest, SingleTokenAtEndFallsBackForUnsupportedLayouts) {
+    auto model = make_static_attention_model(1u, ov::npuw::NPUW_SDPA_MASK_CAUSAL);
+    for (const auto& node : model->get_ops()) {
+        if (const auto sdpa = ov::as_type_ptr<ov::op::v13::ScaledDotProductAttention>(node)) {
+            const auto factor = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{}, {2.f});
+            sdpa->input(1).replace_source_output(std::make_shared<ov::op::v1::Multiply>(sdpa->input_value(1), factor));
+        }
+    }
+    model->validate_nodes_and_infer_types();
+    ASSERT_TRUE(ov::npuw::LeftAlignedAttention(true, ov::npuw::LeftAlignedAttention::SingleTokenPlacement::AT_END)
+                    .run_on_model(model));
+    const auto ops = model->get_ops();
+    EXPECT_EQ(std::count_if(ops.begin(),
+                            ops.end(),
+                            [](const auto& node) {
+                                return ov::is_type<ov::op::v3::ScatterUpdate>(node);
+                            }),
+              2);
+}
+
+TEST(LeftAlignedAttentionTest, SingleTokenAtEndFallsBackForPresentBeforePastAndZeroWindow) {
+    for (const bool zero_window : {false, true}) {
+        auto model = make_static_attention_model(1u, zero_window ? 0 : ov::npuw::NPUW_SDPA_MASK_CAUSAL);
+        if (!zero_window) {
+            for (const auto& node : model->get_ops()) {
+                const auto concat = ov::as_type_ptr<ov::op::v0::Concat>(node);
+                if (concat && concat->get_input_size() == 2u) {
+                    const auto past = concat->input_value(0);
+                    const auto present = concat->input_value(1);
+                    concat->set_arguments({present, past});
+                }
+            }
+            model->validate_nodes_and_infer_types();
+        }
+        ASSERT_TRUE(ov::npuw::LeftAlignedAttention(true, ov::npuw::LeftAlignedAttention::SingleTokenPlacement::AT_END)
+                        .run_on_model(model));
+        const auto ops = model->get_ops();
+        EXPECT_EQ(std::count_if(ops.begin(),
+                                ops.end(),
+                                [](const auto& node) {
+                                    return ov::is_type<ov::op::v3::ScatterUpdate>(node);
+                                }),
+                  2);
+    }
+}
+
+TEST(LeftAlignedAttentionTest, SingleTokenAtEndRejectsMultiplePresentRows) {
+    auto model = make_static_attention_model(1u, ov::npuw::NPUW_SDPA_MASK_CAUSAL);
+    for (const auto& parameter : model->get_parameters()) {
+        const auto& name = parameter->get_friendly_name();
+        if (name.find("past_key_values") != std::string::npos) {
+            parameter->set_partial_shape({1, 1, kContextCapacity - 2u, 1});
+        } else if (name == "present_key" || name == "present_value") {
+            parameter->set_partial_shape({1, 1, 2, 1});
+        }
+    }
+    model->validate_nodes_and_infer_types();
+    EXPECT_THROW(ov::npuw::LeftAlignedAttention(true, ov::npuw::LeftAlignedAttention::SingleTokenPlacement::AT_END)
+                     .run_on_model(model),
+                 ov::Exception);
 }
 
 TEST(LeftAlignedAttentionTest, RejectsPastKvAttentionWithUnknownMask) {

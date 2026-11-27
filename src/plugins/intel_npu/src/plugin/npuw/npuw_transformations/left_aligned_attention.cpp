@@ -52,6 +52,64 @@ bool is_layout_op(const std::shared_ptr<ov::Node>& node) {
            ov::is_type<opv3::Broadcast>(node);
 }
 
+bool preserves_sequence_positions(const ConcatPath& path) {
+    const auto& concat_shape = path.concat->get_output_partial_shape(0);
+    if (concat_shape.rank().is_dynamic() ||
+        ov::util::normalize_axis(path.concat->get_axis(), concat_shape.rank().get_length()) != kSequenceAxis) {
+        return false;
+    }
+    size_t sequence_axis = kSequenceAxis;
+    for (const auto& node : path.nodes) {
+        const auto& input_shape = node->get_input_partial_shape(0);
+        const auto& output_shape = node->get_output_partial_shape(0);
+        if (!input_shape.is_static() || !output_shape.is_static()) {
+            return false;
+        }
+        const auto input = input_shape.to_shape();
+        const auto output = output_shape.to_shape();
+        if (sequence_axis >= input.size()) {
+            return false;
+        }
+        if (ov::is_type<opv0::Convert>(node)) {
+            continue;
+        }
+        if (const auto broadcast = ov::as_type_ptr<opv3::Broadcast>(node)) {
+            const auto mode = broadcast->get_broadcast_spec().m_type;
+            if ((mode != ov::op::BroadcastType::NUMPY && mode != ov::op::BroadcastType::BIDIRECTIONAL) ||
+                input.size() != output.size() || input[sequence_axis] != output[sequence_axis]) {
+                return false;
+            }
+            continue;
+        }
+        if (!ov::is_type<opv0::Unsqueeze>(node) && !ov::is_type<opv1::Reshape>(node)) {
+            return false;
+        }
+        size_t input_stride = 1u;
+        for (size_t axis = sequence_axis + 1u; axis < input.size(); ++axis) {
+            input_stride *= input[axis];
+        }
+        size_t output_stride = 1u;
+        std::optional<size_t> output_axis;
+        for (size_t axis = output.size(); axis-- > 0u;) {
+            if (output[axis] == input[sequence_axis] && output_stride == input_stride) {
+                output_axis = axis;
+                break;
+            }
+            output_stride *= output[axis];
+        }
+        if (!output_axis) {
+            return false;
+        }
+        sequence_axis = *output_axis;
+    }
+    return sequence_axis == kSequenceAxis;
+}
+
+bool has_single_present_row(const ConcatPath& path, size_t present_input) {
+    const auto& shape = path.concat->get_input_partial_shape(present_input);
+    return shape.is_static() && shape.size() > kSequenceAxis && shape[kSequenceAxis].get_length() == 1;
+}
+
 std::optional<ConcatPath> find_concat_path(const ov::Output<ov::Node>& sdpa_input) {
     std::vector<std::shared_ptr<ov::Node>> reverse_path;
     auto node = sdpa_input.get_node_shared_ptr();
@@ -240,12 +298,13 @@ std::shared_ptr<opv0::Constant> make_lowest_finite_mask_value(const ov::element:
     OPENVINO_THROW("LeftAlignedAttention: expected a supported real-valued SDPA mask, got ", mask_type);
 }
 
-ov::Output<ov::Node> make_contiguous_mask(const std::shared_ptr<opv0::Parameter>& attention_mask,
-                                          const std::shared_ptr<opv0::Parameter>& past_len,
-                                          const ov::Shape& mask_shape,
-                                          const ov::element::Type& mask_type,
-                                          int64_t sliding_window,
-                                          ov::NodeVector& created_nodes) {
+ov::Output<ov::Node> make_attention_mask(const std::shared_ptr<opv0::Parameter>& attention_mask,
+                                         const std::shared_ptr<opv0::Parameter>& past_len,
+                                         const ov::Shape& mask_shape,
+                                         const ov::element::Type& mask_type,
+                                         int64_t sliding_window,
+                                         bool present_at_end,
+                                         ov::NodeVector& created_nodes) {
     OPENVINO_ASSERT(mask_shape.size() == 4u && mask_shape[0] == 1u && mask_shape[1] == 1u,
                     "LeftAlignedAttention: expected a [1, 1, query, key] SDPA mask.");
     const auto query_length = mask_shape[2];
@@ -265,7 +324,10 @@ ov::Output<ov::Node> make_contiguous_mask(const std::shared_ptr<opv0::Parameter>
                                                              ov::element::i64);
     const auto query_positions = std::make_shared<opv1::Add>(past_len, query_offsets);
     const auto query_positions_col = std::make_shared<opv0::Unsqueeze>(query_positions, i64_vector({1}));
-    std::shared_ptr<ov::Node> valid = std::make_shared<opv1::LessEqual>(key_positions, query_positions_col);
+    std::shared_ptr<ov::Node> valid =
+        present_at_end
+            ? std::static_pointer_cast<ov::Node>(std::make_shared<opv1::Less>(key_positions, query_positions_col))
+            : std::static_pointer_cast<ov::Node>(std::make_shared<opv1::LessEqual>(key_positions, query_positions_col));
     if (sliding_window >= 0) {
         const auto lower_bound = std::make_shared<opv1::Subtract>(query_positions_col, i64_scalar(sliding_window));
         const auto within_window = std::make_shared<opv1::Greater>(key_positions, lower_bound);
@@ -274,12 +336,22 @@ ov::Output<ov::Node> make_contiguous_mask(const std::shared_ptr<opv0::Parameter>
     }
 
     const auto valid_4d = std::make_shared<opv0::Unsqueeze>(valid, i64_vector({0, 1}));
-    const auto diagonal = std::make_shared<opv1::Equal>(key_positions, query_positions_col);
+    const auto diagonal_position =
+        present_at_end ? i64_scalar(static_cast<int64_t>(key_length - 1u))->output(0) : query_positions_col->output(0);
+    const auto diagonal = std::make_shared<opv1::Equal>(key_positions, diagonal_position);
     const auto diagonal_4d = std::make_shared<opv0::Unsqueeze>(diagonal, i64_vector({0, 1}));
     const auto attention_mask_bool = std::make_shared<opv0::Convert>(attention_mask, ov::element::boolean);
     const auto attention_mask_4d = std::make_shared<opv0::Unsqueeze>(attention_mask_bool, i64_vector({1, 2}));
-    const auto padding_or_diagonal = std::make_shared<opv1::LogicalOr>(attention_mask_4d, diagonal_4d);
-    const auto combined = std::make_shared<opv1::LogicalAnd>(valid_4d, padding_or_diagonal);
+    std::shared_ptr<ov::Node> combined;
+    if (present_at_end) {
+        const auto masked_history = std::make_shared<opv1::LogicalAnd>(valid_4d, attention_mask_4d);
+        combined = std::make_shared<opv1::LogicalOr>(masked_history, diagonal_4d);
+        created_nodes.push_back(masked_history);
+    } else {
+        const auto padding_or_diagonal = std::make_shared<opv1::LogicalOr>(attention_mask_4d, diagonal_4d);
+        combined = std::make_shared<opv1::LogicalAnd>(valid_4d, padding_or_diagonal);
+        created_nodes.push_back(padding_or_diagonal);
+    }
     created_nodes.insert(created_nodes.end(),
                          {key_positions,
                           query_offsets,
@@ -291,7 +363,6 @@ ov::Output<ov::Node> make_contiguous_mask(const std::shared_ptr<opv0::Parameter>
                           diagonal_4d,
                           attention_mask_bool,
                           attention_mask_4d,
-                          padding_or_diagonal,
                           combined});
 
     if (mask_type == ov::element::boolean) {
@@ -360,24 +431,35 @@ bool ov::npuw::LeftAlignedAttention::run_on_model(const std::shared_ptr<ov::Mode
         if (!past_len) {
             past_len = find_or_add_past_len(model);
         }
+        bool present_at_end = false;
         if (m_rewrite_kv_cache) {
             const auto present_key_input = find_present_concat_input(key_path->concat);
             const auto present_value_input = find_present_concat_input(value_path->concat);
-            sdpa->input(kSdpaKeyInput)
-                .replace_source_output(make_sdpa_kv_input(*key_path, present_key_input, query_length, past_len));
-            sdpa->input(kSdpaValueInput)
-                .replace_source_output(make_sdpa_kv_input(*value_path, present_value_input, query_length, past_len));
+            present_at_end = m_single_token_placement == SingleTokenPlacement::AT_END && query_length == 1u &&
+                             present_key_input == 1u && present_value_input == 1u &&
+                             mask_kind->second.as<int64_t>() != 0 && preserves_sequence_positions(*key_path) &&
+                             preserves_sequence_positions(*value_path) &&
+                             has_single_present_row(*key_path, present_key_input) &&
+                             has_single_present_row(*value_path, present_value_input);
+            if (!present_at_end) {
+                sdpa->input(kSdpaKeyInput)
+                    .replace_source_output(make_sdpa_kv_input(*key_path, present_key_input, query_length, past_len));
+                sdpa->input(kSdpaValueInput)
+                    .replace_source_output(
+                        make_sdpa_kv_input(*value_path, present_value_input, query_length, past_len));
+            }
         }
 
         ov::NodeVector mask_nodes;
-        const auto contiguous_mask = make_contiguous_mask(attention_mask,
-                                                          past_len,
-                                                          mask_shape.to_shape(),
-                                                          sdpa->get_input_element_type(kSdpaMaskInput),
-                                                          mask_kind->second.as<int64_t>(),
-                                                          mask_nodes);
+        const auto rewritten_mask = make_attention_mask(attention_mask,
+                                                        past_len,
+                                                        mask_shape.to_shape(),
+                                                        sdpa->get_input_element_type(kSdpaMaskInput),
+                                                        mask_kind->second.as<int64_t>(),
+                                                        present_at_end,
+                                                        mask_nodes);
         ov::copy_runtime_info({sdpa, sdpa->input_value(kSdpaMaskInput).get_node_shared_ptr()}, mask_nodes);
-        sdpa->input(kSdpaMaskInput).replace_source_output(contiguous_mask);
+        sdpa->input(kSdpaMaskInput).replace_source_output(rewritten_mask);
         rewritten = true;
     }
 

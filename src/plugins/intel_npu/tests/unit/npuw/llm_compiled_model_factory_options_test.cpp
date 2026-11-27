@@ -29,7 +29,6 @@
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/relu.hpp"
 #include "openvino/op/reshape.hpp"
-#include "openvino/op/scatter_update.hpp"
 #include "openvino/op/subtract.hpp"
 #include "openvino/pass/stateful_to_stateless.hpp"
 #include "openvino/runtime/intel_npu/properties.hpp"
@@ -73,22 +72,6 @@ bool has_left_aligned_kv_scatter(const std::shared_ptr<ov::Model>& model) {
         return op->get_type_name() == std::string("ScatterUpdate") &&
                op->get_friendly_name().find("/left_aligned_sdpa") != std::string::npos;
     });
-}
-
-bool has_left_aligned_scatter_axis(const std::shared_ptr<ov::Model>& model,
-                                   std::string_view concat_name,
-                                   int64_t expected_axis) {
-    for (const auto& op : model->get_ops()) {
-        const auto scatter = ov::as_type_ptr<ov::op::v3::ScatterUpdate>(op);
-        if (scatter == nullptr || scatter->get_friendly_name().find(concat_name) == std::string::npos) {
-            continue;
-        }
-        const auto axis = ov::as_type_ptr<ov::op::v0::Constant>(scatter->input_value(3).get_node_shared_ptr());
-        if (axis != nullptr && axis->get_shape().empty() && axis->cast_vector<int64_t>().front() == expected_axis) {
-            return true;
-        }
-    }
-    return false;
 }
 
 class ArchAwarePlugin final : public NullPlugin {
@@ -1097,7 +1080,7 @@ TEST_F(LLMCompiledModelFactoryOptionsTest, RuntimePastLengthMaskKeepsAttentionIs
     }
 }
 
-TEST_F(LLMCompiledModelFactoryOptionsTest, StaticGenerateUsesScatterAndStillTransposesValues) {
+TEST_F(LLMCompiledModelFactoryOptionsTest, StaticGenerateAvoidsScatterAndStillTransposesValues) {
     RecordingFactory recorder;
     std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
 
@@ -1109,9 +1092,24 @@ TEST_F(LLMCompiledModelFactoryOptionsTest, StaticGenerateUsesScatterAndStillTran
     ASSERT_NE(compiled, nullptr);
 
     const auto& generate = require_call_containing(recorder, "_kv");
-    EXPECT_TRUE(has_left_aligned_kv_scatter(generate.model));
+    EXPECT_FALSE(has_left_aligned_kv_scatter(generate.model));
     EXPECT_TRUE(has_transposed_value_matmul(generate.model, "self_attn"));
-    EXPECT_TRUE(has_left_aligned_scatter_axis(generate.model, "value_concat", 3));
+}
+
+TEST_F(LLMCompiledModelFactoryOptionsTest, StaticGroupedAttentionGenerateAvoidsScatter) {
+    auto config = ov::test::npuw::make_test_model_config();
+    config.num_kv_heads = 2;
+    RecordingFactory recorder;
+    std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
+
+    ASSERT_NO_THROW(compiled = create_compiled_model(
+                        ov::test::npuw::build_llm_test_model(config),
+                        {{"NPUW_LLM_SHARED_HEAD", "NO"}, {"NPUW_LLM_GENERATE_ATTENTION_HINT", "STATIC"}},
+                        recorder));
+    ASSERT_NE(compiled, nullptr);
+    const auto& generate = require_call_containing(recorder, "_kv");
+    EXPECT_FALSE(has_left_aligned_kv_scatter(generate.model));
+    EXPECT_TRUE(has_transposed_value_matmul(generate.model, "self_attn"));
 }
 
 TEST_F(LLMCompiledModelFactoryOptionsTest, MoeModelKeepsHostRoutedStageIntegration) {

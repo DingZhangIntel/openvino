@@ -778,9 +778,13 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
                 (generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::PYRAMID && conventional_generate);
             if (conventional_generate && !m_is_embedding && !m_is_whisper &&
                 !m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_SWA_KV_CACHE_SHRINK>()) {
-                OPENVINO_ASSERT(ov::npuw::LeftAlignedAttention(rewrite_generate_kv).run_on_model(generate_variant),
-                                "Generate model has no supported static attention pattern for the runtime past-length "
-                                "mask contract.");
+                const auto placement = generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::STATIC
+                                           ? ov::npuw::LeftAlignedAttention::SingleTokenPlacement::AT_END
+                                           : ov::npuw::LeftAlignedAttention::SingleTokenPlacement::CONTIGUOUS;
+                OPENVINO_ASSERT(
+                    ov::npuw::LeftAlignedAttention(rewrite_generate_kv, placement).run_on_model(generate_variant),
+                    "Generate model has no supported static attention pattern for the runtime past-length "
+                    "mask contract.");
             }
         }
 
